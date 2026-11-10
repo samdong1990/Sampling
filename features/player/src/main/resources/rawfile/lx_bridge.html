@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src * data: blob:;">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LX Bridge</title>
+</head>
+<body>
+<script>
+(function() {
+  'use strict';
+
+  var proxy = { host: '', port: '' };
+  var isShowedUpdateAlert = false;
+
+  // ---------------------------------------------------------------------------
+  // 初始化代际（generation）
+  //
+  // 历史实现用两个「页面级单向闩锁」：
+  //   isInitedApi  —— onError 与 lx.send('inited') 共用，任一先到就永久置位；
+  //   initEnvCalled —— _lx_init 只能进入一次。
+  // 后果是「音源就绪」偶发失败且不可恢复：
+  //   a) 脚本启动期任何一次瞬时错误（未捕获 Promise 拒绝也会走 onError）→ 上报 init:false
+  //      并永久置位 → 之后脚本恢复正常、再调 lx.send('inited') 会被 reject('Script is inited')，
+  //      同一页面永远不会再上报 status:true；
+  //   b) WebView 被系统回收/刷新后原生侧重新注入，_lx_init 直接早退，脚本永不执行，
+  //      而原生侧的就绪标志仍是 true（假就绪）。
+  // 现在改为：每次注入带一个 gen，按 gen 重置状态、允许重入、允许「失败后再成功」升级。
+  // ---------------------------------------------------------------------------
+  var initGen = -1;
+  /** 本代际是否已上报过 init（成功或失败都算），用于抑制重复的失败上报。 */
+  var initReported = false;
+  /** 本代际是否已成功上报 status:true；成功后不再被错误降级。 */
+  var initOk = false;
+  /** 分片装配器：与原生侧 `_lx_init_parts` 协议保持一致，end 时再消费一次（幂等）。 */
+  var chunkGen = -1;
+  var bridgeMissingLogged = false;
+  /** 全局 error / unhandledrejection 监听是否已注册（页面内只注册一次）。 */
+  var windowErrorHooked = false;
+
+  var EVENT_NAMES = {
+    request: 'request',
+    inited: 'inited',
+    updateAlert: 'updateAlert'
+  };
+  var eventNames = Object.values(EVENT_NAMES);
+  var events = { request: null };
+
+  // ★ 2026-10-30：加上汽水（qs）。此前白名单缺它，脚本上报的 qs 被静默丢掉 —— 界面只显示 5 个平台。
+  var allSources = ['kw', 'kg', 'tx', 'wy', 'mg', 'qs', 'local'];
+  var supportQualitys = {
+    kw: ['128k', '320k', 'flac', 'flac24bit', 'hires', 'atmos', 'atmos_plus', 'master'],
+    kg: ['128k', '320k', 'flac', 'flac24bit', 'hires', 'atmos', 'master'],
+    tx: ['128k', '320k', 'flac', 'flac24bit', 'hires', 'atmos', 'atmos_plus', 'master'],
+    wy: ['128k', '320k', 'flac', 'flac24bit', 'hires', 'atmos', 'master'],
+    mg: ['128k', '320k', 'flac', 'flac24bit', 'hires'],
+    // 汽水：lossless/hi_res/higher/highest/medium 映射后还有 spatial
+    qs: ['128k', '320k', 'flac', 'hires', 'spatial'],
+    local: []
+  };
+  var supportActions = {
+    kw: ['musicUrl', 'lyric', 'pic'],
+    kg: ['musicUrl', 'lyric', 'pic'],
+    tx: ['musicUrl', 'lyric', 'pic'],
+    wy: ['musicUrl', 'lyric', 'pic'],
+    mg: ['musicUrl', 'lyric', 'pic'],
+    xm: ['musicUrl', 'lyric', 'pic'],
+    qs: ['musicUrl', 'lyric', 'pic'],
+    local: ['musicUrl', 'lyric', 'pic']
+  };
+
+  function sendToNative(data) {
+    try {
+      if (window.ohos_bridge && window.ohos_bridge.onMessage) {
+        window.ohos_bridge.onMessage(JSON.stringify(data));
+        return;
+      }
+      // 桥不可用时以前是完全静默的（原生侧又没有接 onConsole），排障时看不到任何线索。
+      if (!bridgeMissingLogged) {
+        bridgeMissingLogged = true;
+        console.error('sendToNative: ohos_bridge 不可用, event=' + data.event);
+      }
+    } catch(e) {
+      console.error('sendToNative error:', e);
+    }
+  }
+
+  /** 分片装配入口（与原生 injectScript 的 begin/chunk/end 一一对应，可缺省）。 */
+  window._lx_init_begin = function(gen) {
+    chunkGen = gen;
+    window._lx_init_parts = [];
+  };
+
+  window._lx_init_chunk = function(gen, part) {
+    if (gen !== chunkGen) {
+      return;
+    }
+    if (!window._lx_init_parts) {
+      window._lx_init_parts = [];
+    }
+    window._lx_init_parts.push(part);
+  };
+
+  window._lx_init_end = function(gen) {
+    if (gen !== chunkGen) {
+      console.error('_lx_init_end: 代际不匹配 gen=' + gen + ' chunkGen=' + chunkGen);
+      return;
+    }
+    var parts = window._lx_init_parts || [];
+    var json = decodeURIComponent(escape(atob(parts.join(''))));
+    window._lx_init(gen, JSON.parse(json));
+  };
+
+  var pendingRequests = {};
+  var requestIdCounter = 0;
+
+  var nativeFetchIdCounter = 0;
+  var nativeFetchRequests = {};
+
+  function verifyLyricInfo(info) {
+    if (typeof info != 'object' || typeof info.lyric != 'string') throw new Error('failed');
+    if (info.lyric.length > 51200) throw new Error('failed');
+    return {
+      lyric: info.lyric,
+      tlyric: (typeof info.tlyric == 'string' && info.tlyric.length < 5120) ? info.tlyric : null,
+      rlyric: (typeof info.rlyric == 'string' && info.rlyric.length < 5120) ? info.rlyric : null,
+      lxlyric: (typeof info.lxlyric == 'string' && info.lxlyric.length < 8192) ? info.lxlyric : null
+    };
+  }
+
+  function handleRequest(context, reqData) {
+    var requestKey = reqData.requestKey;
+    var data = reqData.data;
+    if (!events.request) {
+      sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: 'Request event is not defined' } });
+      return;
+    }
+    try {
+      events.request.call(context, { source: data.source, action: data.action, info: data.info }).then(function(response) {
+        var sendData = { requestKey: requestKey };
+        try {
+          switch (data.action) {
+            case 'musicUrl':
+              if (typeof response !== 'string' || response.length > 2048 || !/^https?:/.test(response))
+                throw new Error('failed');
+              sendData.result = {
+                source: data.source,
+                action: data.action,
+                data: { type: data.info.type, url: response }
+              };
+              break;
+            case 'lyric':
+              sendData.result = {
+                source: data.source,
+                action: data.action,
+                data: verifyLyricInfo(response)
+              };
+              break;
+            case 'pic':
+              if (typeof response != 'string' || response.length > 2048 || !/^https?:/.test(response))
+                throw new Error('failed');
+              sendData.result = {
+                source: data.source,
+                action: data.action,
+                data: response
+              };
+              break;
+          }
+          sendToNative({ event: 'response', data: { requestKey: requestKey, status: true, result: sendData.result } });
+        } catch(e) {
+          sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: e.message } });
+        }
+      }).catch(function(err) {
+        sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: err.message || 'unknown error' } });
+      });
+    } catch(err) {
+      sendToNative({ event: 'response', data: { requestKey: requestKey, status: false, message: err.message } });
+    }
+  }
+
+  function handleInit(context, info) {
+    if (!info) {
+      sendToNative({ event: 'init', data: { gen: initGen, status: false, message: 'Missing required parameter init info' } });
+      return;
+    }
+    if (info.openDevTools === true) {
+      /* no-op in webview */
+    }
+    var sourceInfo = { sources: {} };
+    try {
+      for (var i = 0; i < allSources.length; i++) {
+        var source = allSources[i];
+        var userSource = info.sources ? info.sources[source] : null;
+        if (!userSource || userSource.type !== 'music') continue;
+        var qualitys = supportQualitys[source];
+        var actions = supportActions[source];
+        sourceInfo.sources[source] = {
+          type: 'music',
+          actions: actions.filter(function(a) { return userSource.actions.indexOf(a) !== -1; }),
+          qualitys: qualitys.filter(function(q) { return userSource.qualitys.indexOf(q) !== -1; })
+        };
+      }
+      // ★ 2026-10-30：白名单之外的平台（脚本新增的平台）原样透传，
+      //   避免"脚本支持但界面看不到"。只做最基本的字段清洗。
+      var known = {};
+      for (var k = 0; k < allSources.length; k++) known[allSources[k]] = true;
+      if (info.sources) {
+        var extraKeys = Object.keys(info.sources);
+        for (var e = 0; e < extraKeys.length; e++) {
+          var ek = extraKeys[e];
+          if (known[ek] || !info.sources[ek]) continue;
+          var es = info.sources[ek];
+          if (!es || es.type !== 'music') continue;
+          sourceInfo.sources[ek] = {
+            type: 'music',
+            actions: (es.actions || []).slice(0, 8),
+            qualitys: (es.qualitys || []).slice(0, 12),
+            name: (typeof es.name === 'string' ? es.name.substring(0, 32) : '')
+          };
+        }
+      }
+    } catch(error) {
+      sendToNative({ event: 'init', data: { gen: initGen, status: false, message: error.message } });
+      return;
+    }
+    // 先置位再上报：避免 sendToNative 同步回流时被 onError 抢先把本代际标成"已失败"
+    initOk = true;
+    initReported = true;
+    sendToNative({ event: 'init', data: { gen: initGen, status: true, sources: sourceInfo.sources } });
+  }
+
+  /**
+   * ★ 2026-10-30：很多脚本（如「独家音源」）**不上报** updateAlert，只在 console 里打
+   * `[音源] 更新提示: … url=https://…`。这里在控制台入口扫一次，命中就补发一个
+   * 标准 updateAlert 事件给原生 —— 这样「检查更新」才有东西可读。
+   * 同一 url 只发一次，避免刷屏。
+   */
+  var lastAlertUrl = '';
+  function sniffUpdateNotice(text) {
+    try {
+      if (typeof text !== 'string' || text.indexOf('更新提示') === -1) return;
+      var m = text.match(/url=(\S+)/);
+      if (!m || m.length < 2) return;
+      var u = m[1];
+      if (u === lastAlertUrl) return;
+      lastAlertUrl = u;
+      sendToNative({ event: 'updateAlert', data: { log: text.substring(0, 200), updateUrl: u } });
+    } catch (e) {
+    }
+  }
+  var __rawLog = console.log;
+  console.log = function () {
+    try { sniffUpdateNotice(Array.prototype.join.call(arguments, ' ')); } catch (e) {}
+    return __rawLog.apply(console, arguments);
+  };
+
+  function handleShowUpdateAlert(data, resolve, reject) {
+    if (!data || typeof data != 'object') return reject(new Error('parameter format error.'));
+    if (!data.log || typeof data.log != 'string') return reject(new Error('log is required.'));
+    if (data.updateUrl && !/^https?:\/\/[^\s$.?#].[^\s]*$/.test(data.updateUrl) && data.updateUrl.length > 1024) delete data.updateUrl;
+    if (data.log.length > 1024) data.log = data.log.substring(0, 1024) + '...';
+    sendToNative({ event: 'updateAlert', data: { log: data.log, updateUrl: data.updateUrl } });
+    resolve();
+  }
+
+  /**
+   * 上报脚本错误。
+   * 与旧实现的差别：失败上报不再永久闩锁——本代际失败只报一次，
+   * 但脚本恢复后 `lx.send('inited')` 仍可把状态升级为 status:true。
+   */
+  function onError(errorMessage) {
+    if (initOk) {
+      // 已经成功就绪，后续错误只记录，不降级（避免一次瞬时异常把可用引擎打回未就绪）
+      console.error('onError(after ready): ' + errorMessage);
+      return;
+    }
+    if (initReported) {
+      console.error('onError(already reported): ' + errorMessage);
+      return;
+    }
+    initReported = true;
+    if (errorMessage.length > 1024) errorMessage = errorMessage.substring(0, 1024) + '...';
+    sendToNative({ event: 'init', data: { gen: initGen, status: false, message: errorMessage } });
+  }
+
+  function base64ToUint8Array(base64) {
+    var binary = atob(base64);
+    var len = binary.length;
+    var bytes = new Uint8Array(len);
+    for (var i = 0; i < len; i++) { bytes[i] = binary.charCodeAt(i); }
+    return bytes;
+  }
+
+  function uint8ArrayToBase64(bytes) {
+    var binary = '';
+    for (var i = 0; i < bytes.length; i++) { binary += String.fromCharCode(bytes[i]); }
+    return btoa(binary);
+  }
+
+  function uint8ArrayToHex(bytes) {
+    var hex = '';
+    for (var i = 0; i < bytes.length; i++) {
+      var h = bytes[i].toString(16);
+      hex += h.length === 1 ? '0' + h : h;
+    }
+    return hex;
+  }
+
+  function hexToUint8Array(hex) {
+    var len = hex.length / 2;
+    var bytes = new Uint8Array(len);
+    for (var i = 0; i < len; i++) { bytes[i] = parseInt(hex.substr(i*2, 2), 16); }
+    return bytes;
+  }
+
+  function stringToUint8Array(str) {
+    return new TextEncoder().encode(str);
+  }
+
+  function uint8ArrayToString(bytes) {
+    return new TextDecoder().decode(bytes);
+  }
+
+  var BufferPolyfill = {
+    from: function() {
+      var args = arguments;
+      if (args[0] instanceof Uint8Array) return args[0];
+      if (args[0] instanceof ArrayBuffer) return new Uint8Array(args[0]);
+      if (typeof args[0] === 'string') {
+        var enc = (args[1] || 'utf8').toLowerCase();
+        if (enc === 'hex') return hexToUint8Array(args[0]);
+        if (enc === 'base64') return base64ToUint8Array(args[0]);
+        if (enc === 'binary' || enc === 'latin1') {
+          var bytes = new Uint8Array(args[0].length);
+          for (var i = 0; i < args[0].length; i++) bytes[i] = args[0].charCodeAt(i) & 0xFF;
+          return bytes;
+        }
+        return stringToUint8Array(args[0]);
+      }
+      if (Array.isArray(args[0])) return new Uint8Array(args[0]);
+      return new Uint8Array(0);
+    },
+    alloc: function(size, fill) {
+      var buf = new Uint8Array(size);
+      if (fill !== undefined) buf.fill(typeof fill === 'number' ? fill : 0);
+      return buf;
+    },
+    concat: function(buffers) {
+      var totalLen = 0;
+      for (var i = 0; i < buffers.length; i++) totalLen += buffers[i].length;
+      var result = new Uint8Array(totalLen);
+      var offset = 0;
+      for (var i = 0; i < buffers.length; i++) {
+        result.set(buffers[i], offset);
+        offset += buffers[i].length;
+      }
+      return result;
+    }
+  };
+
+  function bufToString(buf, format) {
+    format = (format || 'utf8').toLowerCase();
+    if (format === 'hex') return uint8ArrayToHex(buf);
+    if (format === 'base64') return uint8ArrayToBase64(buf);
+    if (format === 'binary' || format === 'latin1') {
+      var str = '';
+      for (var i = 0; i < buf.length; i++) str += String.fromCharCode(buf[i]);
+      return str;
+    }
+    return uint8ArrayToString(buf);
+  }
+
+  // ---------------------------------------------------------------------------
+  // >>> LX-BRIDGE-MD5-START
+  // ---------------------------------------------------------------------------
+  // 标准字节级 MD5（RFC 1321），与 Node 的 crypto.createHash('md5') 完全一致。
+  //
+  // 历史实现有【三处】错误，是音源请求 403「时间签名验证失败」的根因：
+  //   1) 调用侧把签名输入先做了 URI 转义（斜杠变 %2F、空格变 %20 …），签名输入被篡改；
+  //   2) 内部按 UTF-16 code unit（charCodeAt）而非 UTF-8 字节填充，非 ASCII 全错；
+  //   3) 常量表被抄错（例如第 22 项少了首位、第 57 项数值不对），即便纯 ASCII 输入也算错。
+  // 现统一为「先取 UTF-8 字节，再走标准 MD5 轮函数 + 标准常量表」。
+  // 回归由 features/player/src/test/md5_test.js 守住（逐条比对 node:crypto）。
+  // ---------------------------------------------------------------------------
+
+  // 标准 MD5 每轮左移位数（RFC 1321）
+  var MD5_S = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+  ];
+
+  // 标准 MD5 正弦常量表 T[i] = floor(abs(sin(i+1)) * 2^32)（RFC 1321）
+  var MD5_K = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+  ];
+
+  // 每轮消息字索引：g = 16 轮里的下标规则
+  function md5WordIndex(round, i) {
+    if (round === 0) return i;
+    if (round === 1) return (5 * i + 1) % 16;
+    if (round === 2) return (3 * i + 5) % 16;
+    return (7 * i) % 16;
+  }
+
+  function md5RotateLeft(v, n) {
+    return ((v << n) | (v >>> (32 - n))) | 0;
+  }
+
+  /**
+   * 任意输入 → UTF-8 字节。
+   * 支持 string / Uint8Array / 其他 TypedArray / ArrayBuffer / Array。
+   */
+  function md5ToBytes(input) {
+    if (typeof input === 'string') return new TextEncoder().encode(input);
+    if (input instanceof Uint8Array) return input;
+    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (ArrayBuffer.isView(input)) {
+      return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    }
+    if (Array.isArray(input)) return new Uint8Array(input);
+    throw new Error('md5 param required a string or byte array');
+  }
+
+  /** 字节级 MD5，返回 32 位小写十六进制串。 */
+  function md5Bytes(bytes) {
+    var i;
+    var len = bytes.length;
+
+    // ---- 填充：0x80 + 若干 0x00，使总长 ≡ 56 (mod 64)，末尾 8 字节小端存放比特长度 ----
+    var padLen = len + 1;
+    while (padLen % 64 !== 56) { padLen++; }
+    var total = padLen + 8;
+    var msg = new Uint8Array(total);
+    msg.set(bytes, 0);
+    msg[len] = 0x80;
+    // 比特长度 = 字节数 * 8；高 32 位保留（本桥接不会出现 >512MB 的输入）
+    var bitLenLow = (len * 8) >>> 0;
+    msg[total - 8] = bitLenLow & 0xff;
+    msg[total - 7] = (bitLenLow >>> 8) & 0xff;
+    msg[total - 6] = (bitLenLow >>> 16) & 0xff;
+    msg[total - 5] = (bitLenLow >>> 24) & 0xff;
+    msg[total - 4] = 0;
+    msg[total - 3] = 0;
+    msg[total - 2] = 0;
+    msg[total - 1] = 0;
+
+    // ---- 压缩 ----
+    var a0 = 0x67452301;
+    var b0 = 0xefcdab89;
+    var c0 = 0x98badcfe;
+    var d0 = 0x10325476;
+    var m = new Array(16);
+
+    for (var chunk = 0; chunk < total; chunk += 64) {
+      for (i = 0; i < 16; i++) {
+        var o = chunk + i * 4;
+        m[i] = (msg[o] | (msg[o + 1] << 8) | (msg[o + 2] << 16) | (msg[o + 3] << 24)) | 0;
+      }
+      var a = a0, b = b0, c = c0, d = d0;
+      for (i = 0; i < 64; i++) {
+        var round = (i / 16) | 0;
+        var f, g;
+        if (round === 0) {
+          f = (b & c) | ((~b) & d);
+        } else if (round === 1) {
+          f = (d & b) | ((~d) & c);
+        } else if (round === 2) {
+          f = b ^ c ^ d;
+        } else {
+          f = c ^ (b | (~d));
+        }
+        g = md5WordIndex(round, i);
+        f = (f + a + MD5_K[i] + m[g]) | 0;
+        a = d;
+        d = c;
+        c = b;
+        b = (b + md5RotateLeft(f, MD5_S[i])) | 0;
+      }
+      a0 = (a0 + a) | 0;
+      b0 = (b0 + b) | 0;
+      c0 = (c0 + c) | 0;
+      d0 = (d0 + d) | 0;
+    }
+
+    return md5WordToHex(a0) + md5WordToHex(b0) + md5WordToHex(c0) + md5WordToHex(d0);
+  }
+
+  /** 32 位整数 → 8 位小写十六进制（小端字节序输出，与标准 MD5 一致）。 */
+  function md5WordToHex(word) {
+    var hex = '';
+    for (var i = 0; i < 4; i++) {
+      var byte = (word >>> (i * 8)) & 0xff;
+      hex += (byte < 16 ? '0' : '') + byte.toString(16);
+    }
+    return hex;
+  }
+
+  /** 对外签名：md5(string | bytes) → 32 位小写十六进制。 */
+  function md5(input) {
+    return md5Bytes(md5ToBytes(input));
+  }
+  // <<< LX-BRIDGE-MD5-END
+
+  async function cryptoAesEncrypt(data, mode, key, iv) {
+    var algoName = 'AES-CBC';
+    if (mode.indexOf('ecb') !== -1) algoName = 'AES-ECB';
+    else if (mode.indexOf('cbc') !== -1) algoName = 'AES-CBC';
+    var keyLen = key.length * 8;
+    var algo = { name: algoName };
+    if (algoName === 'AES-CBC') algo.iv = iv;
+    var cryptoKey = await crypto.subtle.importKey('raw', key, algo, false, ['encrypt']);
+    var encData = await crypto.subtle.encrypt(algo, cryptoKey, data);
+    return new Uint8Array(encData);
+  }
+
+  async function cryptoRsaEncrypt(data, keyStr) {
+    var pemHeader = '-----BEGIN PUBLIC KEY-----';
+    var pemFooter = '-----END PUBLIC KEY-----';
+    var pemContents = keyStr.replace(/[\r\n]/g, '').replace(pemHeader, '').replace(pemFooter, '').replace(/-----BEGIN RSA PUBLIC KEY-----/, '').replace(/-----END RSA PUBLIC KEY-----/, '');
+    var keyData = base64ToUint8Array(pemContents);
+    var cryptoKey = await crypto.subtle.importKey('spki', keyData, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
+    var encData = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, cryptoKey, data);
+    return new Uint8Array(encData);
+  }
+
+  function cryptoRandomBytes(size) {
+    var buf = new Uint8Array(size);
+    crypto.getRandomValues(buf);
+    return buf;
+  }
+
+  async function zlibInflate(buf) {
+    if (typeof DecompressionStream !== 'undefined') {
+      try {
+        var ds = new DecompressionStream('deflate');
+        var writer = ds.writable.getWriter();
+        writer.write(buf);
+        writer.close();
+        var reader = ds.readable.getReader();
+        var chunks = [];
+        while (true) {
+          var result = await reader.read();
+          if (result.done) break;
+          chunks.push(new Uint8Array(result.value));
+        }
+        var totalLen = 0;
+        for (var i = 0; i < chunks.length; i++) totalLen += chunks[i].length;
+        var result = new Uint8Array(totalLen);
+        var offset = 0;
+        for (var i = 0; i < chunks.length; i++) {
+          result.set(chunks[i], offset);
+          offset += chunks[i].length;
+        }
+        return result;
+      } catch(e) {
+        throw new Error('decompress error: ' + e.message);
+      }
+    }
+    throw new Error('DecompressionStream not available');
+  }
+
+  async function zlibDeflate(data) {
+    if (typeof CompressionStream !== 'undefined') {
+      try {
+        var cs = new CompressionStream('deflate');
+        var writer = cs.writable.getWriter();
+        writer.write(data);
+        writer.close();
+        var reader = cs.readable.getReader();
+        var chunks = [];
+        while (true) {
+          var result = await reader.read();
+          if (result.done) break;
+          chunks.push(new Uint8Array(result.value));
+        }
+        var totalLen = 0;
+        for (var i = 0; i < chunks.length; i++) totalLen += chunks[i].length;
+        var result = new Uint8Array(totalLen);
+        var offset = 0;
+        for (var i = 0; i < chunks.length; i++) {
+          result.set(chunks[i], offset);
+          offset += chunks[i].length;
+        }
+        return result;
+      } catch(e) {
+        throw new Error('compress error: ' + e.message);
+      }
+    }
+    throw new Error('CompressionStream not available');
+  }
+
+  var scriptInfo = { name: '', description: '', version: '', author: '', homepage: '', rawScript: '' };
+
+  /**
+   * 注入入口。
+   * @param gen 初始化代际；原生侧每次注入递增，用于区分「同一次注入的重复调用」与
+   *            「刷新/换脚本后的新一次注入」。旧协议只传一个参数，此时 gen 为 undefined，
+   *            按 -1 处理（等价于首次注入）。
+   * @param initData 注入载荷（旧协议为第一个参数）。
+   */
+  window._lx_init = function(gen, initData) {
+    if (initData === undefined) {
+      // 兼容旧的单参数调用：window._lx_init(initData)
+      initData = gen;
+      gen = -1;
+    }
+    if (!initData || typeof initData !== 'object') {
+      sendToNative({ event: 'init', data: { gen: gen, status: false, message: 'lx_init: 载荷缺失或格式错误' } });
+      return;
+    }
+    if (gen === initGen && initOk) {
+      // 同代际且已成功：重复注入直接忽略（原来的 initEnvCalled 语义，但只锁成功的这一次）
+      return;
+    }
+    if (gen !== initGen) {
+      // 新一代际：重置本代际的闩锁与事件处理器，允许刷新/换脚本后重新初始化
+      console.info('_lx_init: 新代际 gen=' + gen + '（上一代 ' + initGen + '）');
+      initGen = gen;
+      initReported = false;
+      initOk = false;
+      events.request = null;
+    } else {
+      // 同代际重试：清掉上一次的失败标记，允许重新上报
+      initReported = false;
+    }
+
+    proxy.host = initData.proxy ? (initData.proxy.host || '') : '';
+    proxy.port = initData.proxy.port || '';
+
+    scriptInfo.name = initData.name || '';
+    scriptInfo.description = initData.description || '';
+    scriptInfo.version = initData.version || '';
+    scriptInfo.author = initData.author || '';
+    scriptInfo.homepage = initData.homepage || '';
+    scriptInfo.rawScript = initData.script || '';
+
+    var abortControllers = {};
+
+  window._lx_handleFetchResponse = function(requestId, errorStr, statusCode, headersJson, bodyText) {
+    var entry = nativeFetchRequests[requestId];
+    if (!entry) return;
+    clearTimeout(entry.timeoutId);
+    delete nativeFetchRequests[requestId];
+
+    if (errorStr) {
+      entry.callback(new Error(errorStr), null, null);
+      return;
+    }
+
+    var respHeaders = {};
+    try {
+      var parsedHeaders = JSON.parse(headersJson || '{}');
+      for (var hk in parsedHeaders) {
+        if (Object.prototype.hasOwnProperty.call(parsedHeaders, hk)) {
+          respHeaders[hk.toLowerCase()] = parsedHeaders[hk];
+        }
+      }
+    } catch(_e) {}
+
+    var bodyParsed = bodyText;
+    try { bodyParsed = JSON.parse(bodyText); } catch(_e) {}
+
+    entry.callback(null, {
+      statusCode: statusCode,
+      statusMessage: 'OK',
+      headers: respHeaders,
+      body: bodyParsed,
+      raw: bodyText || ''
+    }, bodyParsed);
+  };
+
+    window.lx = {
+      EVENT_NAMES: EVENT_NAMES,
+      request: function(url, options, callback) {
+        var method = (options.method || 'GET').toUpperCase();
+        var timeout = (typeof options.timeout === 'number' && options.timeout > 0) ? Math.min(options.timeout, 60000) : 60000;
+        var headers = options.headers || {};
+        if (!headers['Accept'] && !headers['accept']) headers['Accept'] = 'application/json';
+        if (!headers['User-Agent'] && !headers['user-agent']) headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36';
+        var body = null;
+        if (options.body) {
+          if (typeof options.body === 'object') {
+            body = JSON.stringify(options.body);
+            if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json';
+          } else body = options.body;
+        } else if (options.form) {
+          var formParts = [];
+          for (var fk in options.form) {
+            if (Object.prototype.hasOwnProperty.call(options.form, fk)) {
+              formParts.push(encodeURIComponent(fk) + '=' + encodeURIComponent(options.form[fk]));
+            }
+          }
+          body = formParts.join('&');
+          if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        } else if (options.formData) {
+          body = JSON.stringify(options.formData);
+          if (!headers['Content-Type'] && !headers['content-type']) headers['Content-Type'] = 'application/json';
+        }
+        var requestId = ++nativeFetchIdCounter;
+        nativeFetchRequests[requestId] = { callback: callback, timeoutId: null };
+
+        sendToNative({
+          event: 'nativeFetch',
+          data: {
+            requestId: requestId,
+            url: url,
+            method: method,
+            headers: headers,
+            body: body,
+            timeout: timeout
+          }
+        });
+
+        var timeoutId = setTimeout(function() {
+          var entry = nativeFetchRequests[requestId];
+          if (entry) {
+            delete nativeFetchRequests[requestId];
+            entry.callback(new Error('Request timeout'), null, null);
+          }
+        }, timeout);
+        nativeFetchRequests[requestId].timeoutId = timeoutId;
+
+        return function abort() {
+          var entry = nativeFetchRequests[requestId];
+          if (entry) {
+            clearTimeout(entry.timeoutId);
+            delete nativeFetchRequests[requestId];
+          }
+        };
+      },
+      send: function(eventName, data) {
+        return new Promise(function(resolve, reject) {
+          if (eventNames.indexOf(eventName) === -1) return reject(new Error('The event is not supported: ' + eventName));
+          switch (eventName) {
+            case EVENT_NAMES.inited:
+              // 已经成功上报过本代际的 inited 才拒绝；脚本启动期先失败、之后恢复再上报的
+              // 情况必须放行（旧实现这里与 onError 共用闩锁，一旦失败就永久拒绝，是偶发
+              // "音源未就绪" 的直接原因）。
+              if (initOk) return reject(new Error('Script is inited'));
+              handleInit(this, data);
+              resolve();
+              break;
+            case EVENT_NAMES.updateAlert:
+              if (isShowedUpdateAlert) return reject(new Error('The update alert can only be called once.'));
+              isShowedUpdateAlert = true;
+              handleShowUpdateAlert(data, resolve, reject);
+              break;
+            default:
+              reject(new Error('Unknown event name: ' + eventName));
+          }
+        });
+      },
+      on: function(eventName, handler) {
+        if (eventNames.indexOf(eventName) === -1) return Promise.reject(new Error('The event is not supported: ' + eventName));
+        switch (eventName) {
+          case EVENT_NAMES.request:
+            events.request = handler;
+            break;
+          default: return Promise.reject(new Error('The event is not supported: ' + eventName));
+        }
+        return Promise.resolve();
+      },
+      utils: {
+        crypto: {
+          aesEncrypt: function(buffer, mode, key, iv) {
+            return cryptoAesEncrypt(buffer, mode, key, iv);
+          },
+          rsaEncrypt: function(buffer, key) {
+            return cryptoRsaEncrypt(buffer, key);
+          },
+          randomBytes: function(size) {
+            return cryptoRandomBytes(size);
+          },
+          md5: function(data) {
+            // 标准 MD5：字符串按 UTF-8 字节计算，也接受 TypedArray / Array / ArrayBuffer。
+            // 绝对不要再套 encodeURIComponent —— 那会篡改签名输入（历史 403 根因）。
+            return md5(data);
+          }
+        },
+        buffer: {
+          from: function() {
+            return BufferPolyfill.from.apply(BufferPolyfill, arguments);
+          },
+          bufToString: function(buf, format) {
+            return bufToString(buf, format);
+          }
+        },
+        zlib: {
+          inflate: function(buf) {
+            return zlibInflate(buf);
+          },
+          deflate: function(data) {
+            return zlibDeflate(data);
+          }
+        }
+      },
+      currentScriptInfo: {
+        name: initData.name || '',
+        description: initData.description || '',
+        version: initData.version || '',
+        author: initData.author || '',
+        homepage: initData.homepage || '',
+        rawScript: initData.script || ''
+      },
+      version: '2.0.0',
+      env: 'mobile'
+    };
+
+    // 全局错误监听只在页面内注册一次：同页面重复注入（重试/换脚本）时重复注册会让
+    // 同一条错误被上报多次，也会让 handler 越积越多。
+    if (!windowErrorHooked) {
+      windowErrorHooked = true;
+      window.addEventListener('error', function(event) {
+        if (event.isTrusted) onError(event.message.replace(/^Uncaught\sError:\s/, ''));
+      });
+      window.addEventListener('unhandledrejection', function(event) {
+        if (!event.isTrusted) return;
+        var message = typeof event.reason === 'string' ? event.reason : (event.reason && event.reason.message) ? event.reason.message : String(event.reason);
+        onError(message.replace(/^Error:\s/, ''));
+      });
+    }
+
+    try {
+      eval(initData.script);
+    } catch(e) {
+      onError(e.message);
+    }
+  };
+
+  window._lx_handleRequest = function(reqKey, reqDataJson) {
+    try {
+      var reqData = JSON.parse(reqDataJson);
+      handleRequest(window, { requestKey: reqKey, data: reqData });
+    } catch(e) {
+      sendToNative({ event: 'response', data: { requestKey: reqKey, status: false, message: e.message } });
+    }
+  };
+
+})();
+</script>
+</body>
+</html>

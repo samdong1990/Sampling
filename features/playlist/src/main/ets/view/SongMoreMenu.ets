@@ -1,0 +1,730 @@
+/*
+ * Copyright (c) 2026 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { AppStorageV2 } from '@kit.ArkUI';
+import {
+  AmbientState,
+  AppStorageKeys,
+  buildBarBlurStyle,
+  MusicAppState,
+  MusicStoreService,
+  PlayedSongRecord,
+  PlaylistDto,
+  SongItem,
+  ThemeState
+} from 'musicbasic';
+import { DownloadUtil, LXQualityOption, LXSearchSong, OnlinePlayUtil, lxGetQualityOptions } from 'player';
+// 「切换平台」复用 localmusic 的歌曲匹配引擎（内部走 player 的 lxSearch）
+import { LyricCandidate, MATCH_PLATFORMS, MatchSongInfo, parseIntervalMs, platformLabel, scoreCandidate,
+  searchCandidates } from 'localmusic';
+import { notifyPlaylistChanged } from '../util/PlaylistRefreshBus';
+import { CommentPanel } from 'comment';
+import type { CommentSongRef } from 'comment';
+
+/**
+ * 半模态「重新打开」的冷却时间（ms）。
+ *
+ * 关闭动画（约 300ms）没走完就把 isShow 置回 true，框架会当成同一次关闭处理 ——
+ * 表现是「弹层刚弹出来立刻又收回去」。与播放页菜单弹层同一套处理。
+ */
+const SHEET_REOPEN_GUARD_MS: number = 360;
+
+/**
+ * Shared "more" button + popup menu for song rows: play, download,
+ * add to playlist, and add to favorites.
+ */
+@ComponentV2
+export struct SongMoreMenu {
+  /** Song data shown in the menu actions. */
+  @Param song: LXSearchSong = {
+    songId: '', name: '', singer: '', albumName: '', albumId: '',
+    source: '', interval: '', img: '', types: []
+  };
+  /** Optional icon size override. */
+  @Param iconSize: number = 20;
+  /** Optional icon color. */
+  @Param iconColor: ResourceColor = $r('app.color.font_tertiary');
+  /** Playlist id when the song belongs to a user playlist; enables the delete action. */
+  @Param playlistId: string = '';
+  /** Callback invoked after a song is deleted from the playlist. */
+  @Param onSongDeleted: (() => void) | null = null;
+  /**
+   * 「切换平台」成功后的回调。
+   *
+   * 换源改了库里的数据（收藏 / 历史），但**列表页自己不一定能感知到** ——
+   * 靠 `@Monitor('store.xxxVersion')` 有时不实时（Repeat/ForEach 复用节点、
+   * 页面还在不在前台都会影响）。所以照「重命名歌单」那套做法：
+   * 由调用方在这里**显式刷新自己的列表**。
+   */
+  @Param onSongSwitched: (() => void) | null = null;
+
+  /** Global music app state for playback requests. */
+  @Local appState: MusicAppState =
+    AppStorageV2.connect(MusicAppState, AppStorageKeys.MUSIC_APP_STATE, () => new MusicAppState())!;
+  /** Local store for playlists and favorites. */
+  @Local store: MusicStoreService = MusicStoreService.getInstance();
+  /** When true the bottom sheet is shown. */
+  @Local showSheet: boolean = false;
+  /** Active sheet content: 1 = download quality, 2 = add-to-playlist picker, 3 = switch platform. */
+  @Local sheetType: number = 0;
+  /** 上一次弹层关闭动画结束的时间戳（见 openSheet 的冷却逻辑）。 */
+  private sheetClosedAtMs: number = 0;
+  /** 「切换平台」：正在搜索目标平台（弹层里显示 loading）。 */
+  @Local switching: boolean = false;
+  /** 「切换平台」：当前正在搜的目标平台。 */
+  @Local switchTarget: string = '';
+  /** Download quality sheet: loading flag + resolved quality/size options. */
+  @Local qualityLoading: boolean = false;
+  @Local qualityOptions: LXQualityOption[] = [];
+  /** Playlists snapshot shown in the picker sheet. */
+  @Local playlists: PlaylistDto[] = [];
+  /** New playlist name input. */
+  @Local newPlaylistName: string = '';
+  /** App accent color for buttons. */
+  @Local themeState: ThemeState =
+    AppStorageV2.connect(ThemeState, AppStorageKeys.THEME_STATE, () => new ThemeState())!;
+  /** Ambient material level driving the popup frosted glass strength. */
+  @Local ambientState: AmbientState =
+    AppStorageV2.connect(AmbientState, AppStorageKeys.AMBIENT_STATE, () => new AmbientState())!;
+
+  private toast(message: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: message, duration: 2000 });
+  }
+
+  /** Frosted glass strength of the popup, following the ambient light level. */
+  private menuBlur(): BlurStyle {
+    // 与全局同一张档位表（原来的 BlurStyle.Thin/Regular/Thick 是旧式固定蒙版，暗色下发灰）
+    return buildBarBlurStyle(this.ambientState.level);
+  }
+
+  /** Plays the song via the LX engine. */
+  private playSong(): void {
+    void OnlinePlayUtil.playSearchSong(this.appState, this.song, this.getUIContext());
+  }
+
+  /** 打开下载音质弹层：先实时拉取音质+大小（mg3 同款流程）。 */
+  private downloadSongSnapshot: LXSearchSong | undefined = undefined;
+  private qualityGeneration: number = 0;
+
+  private async openQualitySheet(): Promise<void> {
+    const song: LXSearchSong = {
+      source: this.song.source, songId: this.song.songId, name: this.song.name, singer: this.song.singer,
+      albumName: this.song.albumName, albumId: this.song.albumId, interval: this.song.interval,
+      img: this.song.img, types: this.song.types.slice()
+    };
+    this.downloadSongSnapshot = song;
+    const generation: number = ++this.qualityGeneration;
+    if (this.store.getDownloadQualityMode() === 'follow') {
+      console.info('[RzdDownloadQuality] follow direct entry=song-more');
+      void DownloadUtil.downloadSong(song.source, song.songId, song.name, song.singer, '',
+        this.getUIContext(), song.img, song.albumName);
+      return;
+    }
+    console.info('[RzdDownloadQuality] manual picker entry=song-more');
+    this.qualityLoading = true;
+    this.qualityOptions = [];
+    this.openSheet(1);
+    try {
+      const opts: LXQualityOption[] = await lxGetQualityOptions(song);
+      if (generation !== this.qualityGeneration) {
+        return;
+      }
+      opts.sort((a: LXQualityOption, b: LXQualityOption): number => a.size - b.size);
+      this.qualityOptions = opts;
+    } catch (_e) {
+      this.qualityOptions = [];
+    }
+    this.qualityLoading = false;
+    if (this.qualityOptions.length === 0) {
+      this.toast('暂无可用音质信息');
+    }
+  }
+
+  /**
+   * 打开弹层并切到指定内容（1 音质 / 2 添加到歌单 / 3 切换平台 / 4 评论）。
+   *
+   * 带一次「关闭动画冷却」：刚关完马上再点，等几十毫秒再开，
+   * 否则会「刚弹出来立刻又收回去」（与播放页菜单弹层同一个 Bug）。
+   */
+  private openSheet(type: number): void {
+    this.sheetType = type;
+    if (this.showSheet) {
+      return;   // 已经开着：只切内容
+    }
+    const since: number = Date.now() - this.sheetClosedAtMs;
+    if (since >= SHEET_REOPEN_GUARD_MS) {
+      this.showSheet = true;
+      return;
+    }
+    setTimeout((): void => {
+      this.showSheet = true;
+    }, SHEET_REOPEN_GUARD_MS - since);
+  }
+
+  /** Downloads the song at the chosen quality. */
+  private downloadSongQuality(quality: string): void {
+    const song: LXSearchSong | undefined = this.downloadSongSnapshot;
+    if (!this.showSheet || this.sheetType !== 1 || song === undefined || quality.length === 0) {
+      return;
+    }
+    this.showSheet = false;
+    void DownloadUtil.downloadSong(song.source, song.songId, song.name, song.singer,
+      quality, this.getUIContext(), song.img, song.albumName);
+  }
+
+  /** 字节 -> x.xMB（MyApplication3 同款）。 */
+  private formatSize(bytes: number): string {
+    if (bytes <= 0) {
+      return '';
+    }
+    return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+  }
+
+  /** 下载音质弹层：音质/大小/选择 行（标题由 bindSheet 原生 title 提供，与播放详情页一致）。 */
+  @Builder
+  private QualitySheet() {
+    Column() {
+      if (this.qualityLoading) {
+        Row({ space: 8 }) {
+          LoadingProgress()
+            .width(20)
+            .height(20)
+          Text('获取音质信息...')
+            .fontSize(13)
+            .fontColor($r('app.color.font_tertiary'))
+        }
+        .width('100%')
+        .height(56)
+        .justifyContent(FlexAlign.Center)
+      } else {
+        List({ space: 2 }) {
+          ForEach(this.qualityOptions, (q: LXQualityOption) => {
+            ListItem() {
+              Row() {
+                Text(q.type)
+                  .fontSize(15)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.font_primary'))
+                Blank()
+                if (q.size > 0) {
+                  Text(this.formatSize(q.size))
+                    .fontSize(13)
+                    .fontColor($r('app.color.font_tertiary'))
+                }
+              }
+              .width('100%')
+              .padding({ left: 4, right: 4, top: 13, bottom: 13 })
+              .onClick(() => {
+                this.downloadSongQuality(q.type);
+              })
+            }
+          }, (q: LXQualityOption) => q.type)
+        }
+        .width('100%')
+        .height(this.qualityOptions.length * 50)
+        .margin({ top: 8 })
+      }
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+  }
+
+  /**
+   * bindSheet 原生标题（X 关闭按钮由系统保证跟标题水平对齐，与播放详情页同款）。
+   * sheetType: 1 = 下载音质 → "选择下载音质"; 2 = 添加到歌单 → "添加到歌单"; 4 = 评论。
+   */
+  private sheetTitle(): SheetTitleOptions {
+    if (this.sheetType === 2) {
+      return { title: '添加到歌单' };
+    }
+    if (this.sheetType === 3) {
+      return { title: '切换平台' };
+    }
+    if (this.sheetType === 4) {
+      return { title: '评论' };
+    }
+    return { title: '选择下载音质' };
+  }
+
+  /** 按 sheetType 渲染对应弹层内容（单组件只能挂一个 bindSheet）。 */
+  @Builder
+  private ActiveSheet() {
+    if (this.sheetType === 1) {
+      this.QualitySheet()
+    } else if (this.sheetType === 2) {
+      this.PlaylistPickerSheet()
+    } else if (this.sheetType === 3) {
+      this.SwitchPlatformSheet()
+    } else if (this.sheetType === 4) {
+      // 评论：面板根节点是 height('100%')，所以外面这层容器也必须是**确定高度**
+      // （弹层内容区的高度就是弹层高度；这里不能用 layoutWeight —— 弹层内容根节点
+      //  是按内容包高度的，不是弹性容器，layoutWeight 会拿到 0）。
+      // 标题与关闭用 bindSheet 原生的（sheetTitle 的 case 4），面板不再自绘标题栏。
+      Column() {
+        CommentPanel({
+          song: this.commentSongRef(),
+          songKey: this.song.source + '_' + this.song.songId,
+          showHeader: false
+        })
+      }
+      .width('100%')
+      .height('100%')
+    }
+  }
+
+  /** 评论面板要的歌曲身份（在线歌直接用；本地歌由面板里的解析器查匹配记录）。 */
+  private commentSongRef(): CommentSongRef {
+    const ref: CommentSongRef = {
+      source: this.song.source,
+      songId: this.song.songId,
+      name: this.song.name,
+      singer: this.song.singer
+    };
+    return ref;
+  }
+
+  /**
+   * 「切换平台」弹层：列出除当前平台外的平台，点一个就换过去。
+   *
+   * 这一项是用户点名要的（"这首歌当前是酷狗，手动改为 QQ"）。
+   * 匹配**复用引擎**：`localmusic` 的 `LyricMatch.searchCandidates` 就是
+   * "拿歌名+歌手去某个平台搜一批候选"，它内部走 player 的 `lxSearch`；
+   * 打分也用同一套 `scoreCandidate`，所以不需要另写检索逻辑。
+   */
+  @Builder
+  private SwitchPlatformSheet() {
+    Column() {
+      if (this.switching) {
+        Row({ space: 8 }) {
+          LoadingProgress()
+            .width(20)
+            .height(20)
+          Text(`正在 ${platformLabel(this.switchTarget)} 上搜索…`)
+            .fontSize(13)
+            .fontColor($r('app.color.font_tertiary'))
+        }
+        .width('100%')
+        .height(72)
+        .justifyContent(FlexAlign.Center)
+      } else {
+        List({ space: 2 }) {
+          ForEach(this.switchPlatforms(), (platform: string) => {
+            ListItem() {
+              Row({ space: 12 }) {
+                Text(platformLabel(platform))
+                  .fontSize($r('sys.float.Body_L'))
+                  .fontColor($r('app.color.font_primary'))
+                Blank()
+              }
+              .width('100%')
+              .padding({ top: 14, bottom: 14 })
+              .onClick(() => {
+                void this.switchToPlatform(platform);
+              })
+            }
+          }, (platform: string) => 'switch-plat-' + platform)
+        }
+        .width('100%')
+        .scrollBar(BarState.Off)
+      }
+    }
+    .width('100%')
+    .padding({ left: 20, right: 20, top: 4, bottom: 8 })
+  }
+
+  /** @returns 可切换的平台列表（排除当前平台）。 */
+  private switchPlatforms(): string[] {
+    const out: string[] = [];
+    for (let i: number = 0; i < MATCH_PLATFORMS.length; i++) {
+      const p: string = MATCH_PLATFORMS[i];
+      if (p !== this.song.source) {
+        out.push(p);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 把当前这首歌切到另一个平台：搜一批候选 → 打分挑最优 → **就地换源**。
+   *
+   * ⚠️ 按用户要求：**不自动开始播放**。切换只是把"这首歌在哪个平台"改掉，
+   *    然后让列表自己刷新（收藏 / 历史 / 歌单都跟着更新），播放由用户自己点。
+   *
+   * 两处必须处理的细节：
+   *  1. **封面**：新平台的搜索结果不一定带图（`img` 可能是空串），
+   *     那就**沿用原来那张封面**，否则切完就没图了（用户反馈过这个问题）；
+   *  2. **只改本来就存在的那份数据**：收藏里没有、历史里没有，就不往里塞 ——
+   *     不能因为"切个平台"凭空多出一条收藏/历史。
+   *
+   * 刷新机制不需要额外接线：`addFavorite/removeFavorite` 会 +1 `favoriteVersion`、
+   * `addHistory/removeHistoryByIds` 会 +1 `historyVersion`，`MinePage` 上有
+   * `@Monitor('store.historyVersion', 'store.favoriteVersion')` 会自己重读列表；
+   * 歌单侧则走 `notifyPlaylistChanged()` 那套刷新总线。
+   * @param platform 目标平台（kw / kg / tx / mg / wy）。
+   */
+  private async switchToPlatform(platform: string): Promise<void> {
+    this.switchTarget = platform;
+    this.switching = true;
+    const keyword: string = (this.song.name + ' ' + this.song.singer).trim();
+    const wantedMs: number = parseIntervalMs(this.song.interval);
+    let best: MatchSongInfo | null = null;
+    let bestScore: number = 0;
+    // 是否"够格"用引擎自己的判定（nameExact/nameClose + 歌手或时长对上），
+    // 也就是 localmusic 里那套「宁缺勿错」的门槛 —— 不要自己另立标准
+    let bestOk: boolean = false;
+    try {
+      const candidates: MatchSongInfo[] = await searchCandidates(keyword, platform);
+      for (let i: number = 0; i < candidates.length; i++) {
+        const cand: LyricCandidate = scoreCandidate(candidates[i], this.song.name, this.song.singer, wantedMs);
+        if (cand.score > bestScore) {
+          bestScore = cand.score;
+          best = candidates[i];
+          bestOk = cand.autoOk;
+        }
+      }
+    } catch (_e) {
+      best = null;
+      bestOk = false;
+    }
+    this.switching = false;
+    this.showSheet = false;
+    if (best === null || !bestOk) {
+      this.toast(`在 ${platformLabel(platform)} 没找到这首歌`);
+      return;
+    }
+    const matched: MatchSongInfo = best;
+    const oldSource: string = this.song.source;
+    const oldSongId: string = this.song.songId;
+    // 新平台没给封面就沿用旧的：宁可留着原来那张，也不要切成没图
+    const cover: string = matched.img.length > 0 ? matched.img : this.song.img;
+
+    // 1) 收藏：本来收藏过才换源
+    if (oldSource.length > 0 && this.store.isFavorite(oldSource, oldSongId)) {
+      this.store.removeFavorite(oldSource, oldSongId);
+      this.store.addFavorite(this.buildSwitchedRecord(matched, cover));
+    }
+    // 2) 历史：本来在历史里才换源（先按旧 key 删，再按新 key 写回）
+    if (oldSource.length > 0 && this.historyHas(oldSource, oldSongId)) {
+      this.store.removeHistoryByIds([oldSource + '_' + oldSongId]);
+      this.store.addHistory(this.buildSwitchedRecord(matched, cover));
+    }
+    // 3) 歌单等其它列表走刷新总线
+    notifyPlaylistChanged();
+    // 4) 调用方（历史 / 收藏 / 歌单页）显式刷新自己的列表
+    if (this.onSongSwitched !== null) {
+      this.onSongSwitched();
+    }
+    this.toast(`已切换到 ${platformLabel(matched.source)}`);
+  }
+
+  /** @returns 播放历史里是否已经有这首歌（换源只改已经存在的那条）。 */
+  private historyHas(source: string, songId: string): boolean {
+    const key: string = source + '_' + songId;
+    const list: PlayedSongRecord[] = this.store.getHistory();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].source + '_' + list[i].songId === key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 用匹配结果拼一条记录（收藏 / 历史共用）。
+   * @param matched 引擎匹配到的平台歌曲。
+   * @param cover 封面地址（新平台没给图时由调用方传入旧封面）。
+   * @returns 记录。
+   */
+  private buildSwitchedRecord(matched: MatchSongInfo, cover: string): PlayedSongRecord {
+    const record = new PlayedSongRecord();
+    record.songId = matched.songId;
+    record.name = matched.name;
+    record.singer = matched.singer;
+    record.albumName = matched.albumName;
+    record.albumId = matched.albumId;
+    record.source = matched.source;
+    record.interval = matched.interval;
+    record.img = cover;
+    record.quality = '';
+    record.time = Date.now();
+    return record;
+  }
+
+  /** Popup menu items for the song actions. */
+  private menuItems(): MenuElement[] {
+    const items: MenuElement[] = [
+      {
+        value: '播放',
+        action: (): void => {
+          this.playSong();
+        }
+      },
+      {
+        value: '下载',
+        action: (): void => {
+          this.openQualitySheet();
+        }
+      },
+      {
+        value: '添加到歌单',
+        action: (): void => {
+          this.openPlaylistPicker();
+        }
+      },
+      {
+        value: '添加到收藏',
+        action: (): void => {
+          this.addFavorite();
+        }
+      },
+      {
+        value: '添加到播放列表',
+        action: (): void => {
+          this.addToPlayQueue();
+        }
+      },
+      {
+        // 用户点名的功能：手动把这首歌换到另一个平台（例：酷狗 → QQ）
+        value: '切换平台',
+        action: (): void => {
+          this.switching = false;
+          this.openSheet(3);
+        }
+      },
+      {
+        // 查看评论（内置平台评论，见 features/comment）
+        value: '查看评论',
+        action: (): void => {
+          this.openSheet(4);
+        }
+      }
+      // ★ 2026-10-20（用户：「让你改歌曲菜单位置，之前那个你也不删一下」）：
+      //   倍速**只应该出现在播放页的歌曲菜单**（`ControlAreaComponent` 的 `SpeedRows()`），
+      //   列表行这个通用菜单里的那份**已删除**（连同 sheetType 5 / SpeedSheet / applySpeed）。
+    ];
+    if (this.playlistId.length > 0) {
+      items.push({
+        value: '从歌单中删除',
+        action: (): void => {
+          this.deleteFromPlaylist();
+        }
+      });
+    }
+    return items;
+  }
+
+  /** Adds the song to favorites. */
+  private addFavorite(): void {    const record = new PlayedSongRecord();
+    record.songId = this.song.songId;
+    record.name = this.song.name;
+    record.singer = this.song.singer;
+    record.albumName = this.song.albumName;
+    record.albumId = this.song.albumId;
+    record.source = this.song.source;
+    record.interval = this.song.interval;
+    record.img = this.song.img;
+    // 搜歌结果未播放就收藏,quality 留空;后续播放时 refreshFavoriteQuality 自动回填。
+    record.quality = '';
+    record.time = Date.now();
+    this.store.addFavorite(record);
+    this.toast('已添加到收藏');
+  }
+
+  /** Removes the song from the playlist it belongs to. */
+  private deleteFromPlaylist(): void {
+    if (this.playlistId.length === 0) {
+      return;
+    }
+    this.store.removeSongFromPlaylist(this.playlistId, this.song.source, this.song.songId);
+    notifyPlaylistChanged();
+    this.toast('已从歌单中删除');
+    if (this.onSongDeleted !== null) {
+      this.onSongDeleted();
+    }
+  }
+
+  /** Appends the song to the current play queue without starting playback. */
+  private addToPlayQueue(): void {
+    if (this.song.source.length === 0) {
+      this.toast('无法添加本地歌曲');
+      return;
+    }
+    const item = new SongItem();
+    item.id = Date.now();
+    item.title = this.song.name;
+    item.singer = this.song.singer;
+    item.source = this.song.source;
+    item.songId = this.song.songId;
+    item.albumId = this.song.albumId;
+    item.albumName = this.song.albumName;
+    item.cover = this.song.img;
+    item.url = '';
+    item.lyricText = '';
+    const queue = this.appState.playQueue;
+    for (let i = 0; i < queue.length; i++) {
+      if (queue[i].source === item.source && queue[i].songId === item.songId) {
+        this.toast('已在播放列表中');
+        return;
+      }
+    }
+    this.appState.playQueue = [...queue, item];
+    this.toast('已添加到播放列表');
+  }
+
+  /** Opens the add-to-playlist picker sheet. */
+  private openPlaylistPicker(): void {
+    this.playlists = this.store.getPlaylists();
+    this.newPlaylistName = '';
+    this.openSheet(2);
+  }
+
+  /** Adds the song to a playlist. */
+  private addToPlaylist(p: PlaylistDto): void {
+    const record = new PlayedSongRecord();
+    record.songId = this.song.songId;
+    record.name = this.song.name;
+    record.singer = this.song.singer;
+    record.albumName = this.song.albumName;
+    record.albumId = this.song.albumId;
+    record.source = this.song.source;
+    record.interval = this.song.interval;
+    record.img = this.song.img;
+    record.time = Date.now();
+    const added: boolean = this.store.addSongToPlaylist(p.id, record);
+    if (added) {
+      // 显式通知列表页重读：仅靠 @Monitor('store.playlistVersion') 时列表数量不刷新
+      notifyPlaylistChanged();
+    }
+    this.toast(added ? '已添加到「' + p.name + '」' : '歌单中已有该歌曲');
+    this.showSheet = false;
+  }
+
+  /** Creates a playlist and adds the song. */
+  private createPlaylistWithSong(): void {
+    const name: string = this.newPlaylistName.trim();
+    if (name.length === 0) {
+      return;
+    }
+    const p = this.store.createPlaylist(name);
+    this.addToPlaylist(p);
+    this.newPlaylistName = '';
+  }
+
+  /** Add-to-playlist picker sheet content（布局与播放详情页 PlaylistPickerRows 完全一致，标题由 bindSheet 原生 title 提供）. */
+  @Builder
+  private PlaylistPickerSheet() {
+    Column() {
+      TextInput({ text: this.newPlaylistName, placeholder: '请输入歌单名称' })
+        .width('100%')
+        .height(44)
+        .borderRadius(10)
+        .padding({ left: 12, right: 12 })
+        .margin({ top: 4, bottom: 12 })
+        .onChange((value: string) => {
+          this.newPlaylistName = value;
+        })
+
+      Button('新建并添加')
+        .width('100%')
+        .height(40)
+        .fontSize(14)
+        .borderRadius(10)
+        .backgroundColor(this.themeState.color)
+        .fontColor(Color.White)
+        .onClick(() => {
+          this.createPlaylistWithSong();
+        })
+
+      if (this.playlists.length > 0) {
+        Blank().height(12)
+
+        Scroll() {
+          Column({ space: 2 }) {
+            ForEach(this.playlists, (p: PlaylistDto) => {
+              Row() {
+                Text(p.name)
+                  .fontSize(15)
+                  .fontColor($r('app.color.font_primary'))
+                  .maxLines(1)
+                  .layoutWeight(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                Text(p.songs.length + ' 首')
+                  .fontSize(12)
+                  .fontColor($r('app.color.font_tertiary'))
+              }
+              .width('100%')
+              .height(44)
+              .padding({ left: 14, right: 14 })
+              .borderRadius(10)
+              .backgroundColor($r('app.color.background_secondary'))
+              .onClick(() => {
+                this.addToPlaylist(p);
+              })
+            }, (p: PlaylistDto) => p.id)
+          }
+          .width('100%')
+        }
+        .height(170)
+        .scrollBar(BarState.Off)
+      }
+
+      // 底部返回按钮：关闭弹层（与播放详情页同款文字样式）
+      Row() {
+        Text('返回')
+          .fontSize(15)
+          .fontColor($r('app.color.font_tertiary'))
+      }
+      .width('100%')
+      .height(44)
+      .margin({ top: 16 })
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => {
+        this.showSheet = false;
+      })
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, bottom: 24 })
+    .backgroundColor($r('app.color.background_secondary'))
+  }
+
+  /** More button + popup menu. */
+  build() {
+    Column() {
+      SymbolGlyph($r('sys.symbol.dot_grid_1x2_circle'))
+        .fontSize(this.iconSize)
+        .fontColor([this.iconColor])
+    }
+    .bindMenu(this.menuItems(), {
+      backgroundBlurStyle: this.menuBlur()
+    })
+    .bindSheet($$this.showSheet, this.ActiveSheet(), {
+      // 评论要整屏高度才够看；其余弹层按内容自适应
+      height: this.sheetType === 4 ? SheetSize.LARGE : SheetSize.FIT_CONTENT,
+      showClose: true,
+      dragBar: false,
+      // 用 bindSheet 原生 title 区域显示标题，X 关闭按钮由系统保证跟标题水平对齐（与播放详情页一致）
+      title: this.sheetTitle(),
+      backgroundColor: $r('app.color.background_secondary'),
+      onWillDismiss: (action: DismissSheetAction) => {
+        action.dismiss();
+        this.showSheet = false;
+      },
+      onDisappear: (): void => {
+        // 记下关闭动画结束的时刻（重新打开的冷却用）
+        this.sheetClosedAtMs = Date.now();
+      }
+    })
+  }
+}

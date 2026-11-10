@@ -1,0 +1,2905 @@
+/*
+ * Copyright (c) 2026 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { preferences } from '@kit.ArkData';
+import { Context } from '@kit.AbilityKit';
+import { fileIo as fs } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
+import { FavoriteEntry } from '../model/FavoriteEntry';
+import { PlayedSongRecord } from '../model/PlayedSongRecord';
+import { PlaylistDto } from '../model/PlaylistDto';
+import { SongItem } from '../model/SongData';
+import { getAppRuntime } from '../model/AppRuntimeStorage';
+import { appendPlayLog } from './LxLogger';
+
+const STORE_NAME: string = 'music_store';
+const KEY_RUNTIME_DIAGNOSTICS: string = 'runtime_diagnostics_v1';
+const MAX_RUNTIME_DIAGNOSTICS: number = 5000;
+const KEY_HISTORY: string = 'history_list';
+const KEY_FAVORITES: string = 'favorite_list';
+const KEY_FAVORITE_ARTISTS: string = 'favorite_artists';
+const KEY_FAVORITE_ALBUMS: string = 'favorite_albums';
+const KEY_FAVORITE_PLAYLISTS: string = 'favorite_playlists';
+const KEY_SEARCH_HISTORY: string = 'search_history';
+const KEY_AMBIENT_LEVEL: string = 'ambient_level';
+const KEY_THEME_COLOR: string = 'theme_color';
+const KEY_HOME_SOURCE: string = 'home_source';
+const KEY_SHOW_MINI_LYRIC: string = 'show_mini_lyric';
+const KEY_DESKTOP_LYRIC: string = 'desktop_lyric';
+/** 车载蓝牙歌词：通过 AVMetadata.singleLyricText 向蓝牙设备推送当前句（默认关）。 */
+const KEY_BLUETOOTH_LYRIC: string = 'bluetooth_lyric';
+/**
+ * 动态封面（歌手 / 专辑 / 歌单页的 Apple Music motion artwork，**默认开**）。
+ * 消费方：`MotionCoverLayer`（`common/musicbasic/view`）+ `MotionCoverState`（共享状态）。
+ */
+const KEY_MOTION_COVER: string = 'motion_cover_enabled';
+
+/**
+ * 「现在就听」的模式：0 = 常规 / 1 = 熟悉 / 2 = 探索。
+ *
+ * ★ 2026-10-24（甲方：「现在就听左上角那个菜单，不要站位了，做成选择模式（常规模式、熟悉模式、探索模式）」）：
+ *   模式决定自建推荐算法里「已听过的歌 / 新歌」的取用比例（见 `features/recommendation` 的推荐器）：
+ *   - 常规：分类随机（现状）；
+ *   - 熟悉：偏向用户**听过/收藏过**的歌所在分类；
+ *   - 探索：偏向**没出现过**的分类，减少重复。
+ */
+const KEY_FEED_MODE: string = 'feed_mode';
+/** 自建推荐：分类 id → 点过的次数（JSON）。 */
+const KEY_FEED_CATEGORY_PLAYS: string = 'feed_category_plays';
+/** 华为账号登录资料（JSON，形状由 features/player 的 HuaweiAccountService 定义，这里只当字符串存）。 */
+const KEY_HUAWEI_ACCOUNT: string = 'huawei_account';
+/** 华为云盘访问令牌（JSON：accessToken / refreshToken / expiresAt）。 */
+const KEY_HUAWEI_DRIVE_TOKEN: string = 'huawei_drive_token';
+const KEY_PLAYBACK_FLOW_LIGHT: string = 'playback_flow_light';
+/**
+ * 锁屏/后台继续播放（默认 **开**）。
+ *
+ * ★ 2026-10-18（用户：「现在似乎不能锁屏播放，你在播放设置里加一下，默认开」）：
+ *   对应"音频后台长时任务"（`BackgroundUtil.startContinuousTask` /
+ *   `module.json5` 的 `backgroundModes: ["audioPlayback"]` + `KEEP_BACKGROUND_RUNNING`）。
+ *   ⚠️ 默认值必须是 `true`：老用户升级上来没有这条记录，读不到就得按"开"处理，
+ *     否则装上就是"锁屏不播"，正好是用户报的那个现象。
+ */
+const KEY_LOCK_SCREEN_PLAY: string = 'lock_screen_play';
+const KEY_SHOW_SUB_LYRIC: string = 'show_sub_lyric';
+const KEY_SHOW_LYRIC_TRANSLATION: string = 'show_lyric_translation';
+const KEY_SHOW_LYRIC_ROMA: string = 'show_lyric_roma';
+const KEY_LYRIC_S2T: string = 'lyric_s2t';
+const KEY_PLAY_QUALITY: string = 'play_quality';
+const KEY_AUDIO_MIX: string = 'audio_mix';
+/** 启动应用自动开始播放（默认关）。 */
+const KEY_AUTOPLAY_ON_LAUNCH: string = 'autoplay_on_launch';
+const KEY_TUNING_PITCH: string = 'tuning_pitch';
+const KEY_TUNING_EQ: string = 'tuning_eq_gains';
+/** 汽水（FFmpeg 内核）连续失败次数。 */
+const KEY_IJK_FAIL_STREAK: string = 'ijk_fail_streak';
+/** 汽水是否已临时禁用 FFmpeg 内核（连续失败后自动回退 AVPlayer）。 */
+const KEY_IJK_DISABLED: string = 'ijk_disabled';
+/** 播放内核选择：auto=自动 / av=强制系统播放器 / ffmpeg=强制 FFmpeg。 */
+const KEY_ENGINE_MODE: string = 'engine_mode';
+/** 音效开关（JSON：低音/立体声/人声消除/夜间/混响）。 */
+const KEY_AUDIO_EFFECTS: string = 'audio_effects';
+/** 屏幕方向：auto=跟随系统/陀螺仪，portrait=锁定竖屏，landscape=锁定横屏。 */
+const KEY_SCREEN_ORIENTATION: string = 'screen_orientation';
+/** 自定义 EQ 预设（JSON 数组：[{name, gains[5]}]）。 */
+const KEY_EQ_PRESETS: string = 'eq_custom_presets';
+/** USB 独占输出（需要外接 USB DAC）。 */
+const KEY_USB_EXCLUSIVE: string = 'usb_exclusive';
+/** Tab 栏自定义（只允许「现在就听」/「回响」）：JSON "{now:bool,echo:bool,nowFirst:bool}"。 */
+const KEY_TAB_BAR_CONFIG: string = 'tab_bar_config';
+const KEY_DOWNLOAD_SAVE_MODE: string = 'download_save_mode';
+const KEY_DOWNLOAD_QUALITY_MODE: string = 'download_quality_mode';
+const KEY_DOWNLOAD_MANUAL_QUALITY: string = 'download_manual_quality';
+const KEY_DOWNLOAD_NAME_FORMAT: string = 'download_name_format';
+const KEY_DOWNLOAD_DIR_URI: string = 'download_dir_uri';
+const KEY_APP_ICON_VARIANT: string = 'app_icon_variant';
+const KEY_CONCERT_TOKEN: string = 'concert_token';
+const KEY_CONCERT_TOKEN_AT: string = 'concert_token_at';
+const KEY_LYRIC_FPS: string = 'lyric_fps';
+const KEY_LYRIC_CENTER: string = 'lyric_center';
+const KEY_LYRIC_BLUR: string = 'lyric_blur';
+const KEY_CROSS_SCRIPT_FALLBACK: string = 'cross_script_fallback';
+/** 音源脚本参与依次调用的顺序（JSON 字符串数组，空=全部按导入顺序）。 */
+const KEY_SOURCE_SCRIPT_ORDER: string = 'source_script_order';
+const KEY_QUALITY_TIER_HEALTH: string = 'quality_tier_health';
+const KEY_SHOW_HOME_PLAZA: string = 'show_home_plaza';
+const KEY_SHOW_HOME_RANKING: string = 'show_home_ranking';
+const KEY_LYRIC_FONT_SIZE: string = 'lyric_font_size';
+const KEY_PLAYLIST_ADD_POSITION: string = 'playlist_add_position';
+const KEY_PLAYLISTS: string = 'playlists';
+const KEY_SEARCH_SOURCE: string = 'search_source';
+const KEY_SEARCH_CACHE: string = 'search_cache';
+const KEY_PLAY_MODE: string = 'play_mode';
+const KEY_LAST_SONG: string = 'last_song';
+const KEY_CARD_FORM_IDS: string = 'music_card_form_ids';
+const KEY_CARD_PLAYING: string = 'music_card_playing';
+const KEY_CARD_LYRIC: string = 'music_card_lyric';
+const KEY_CARD_PENDING_ACTION: string = 'music_card_pending_action';
+const KEY_LAST_QUEUE: string = 'last_queue';
+const KEY_COLOR_MODE: string = 'color_mode';
+const KEY_KEEP_SCREEN_ON: string = 'keep_screen_on';
+const KEY_DOWNLOAD_QUALITY_TAG: string = 'download_quality_tag';
+const KEY_COVER_CORNER_RADIUS: string = 'cover_corner_radius';
+const KEY_PLAYBACK_FULLSCREEN: string = 'playback_fullscreen';
+const KEY_DOWNLOAD_LRC: string = 'download_lrc';
+const KEY_DOWNLOAD_LRC_ENCODING: string = 'download_lrc_encoding';
+const KEY_PLAY_EXTENDED_QUALITY: string = 'play_extended_quality';
+const KEY_PLAY_EXTENDED_ENABLED: string = 'play_extended_enabled';
+const KEY_DOWNLOAD_TASKS: string = 'download_tasks';
+const KEY_USE_ACCOUNT_REC: string = 'use_account_rec';
+const ACTIVE_SOURCE_FILE: string = 'lx_active_source.txt';
+
+/** Policy groups, not the fallback ordering in player/SourceFallbackUtil. */
+const NETWORK_BASE_QUALITIES: string[] = ['128k', '320k', 'flac', 'flac24bit'];
+const NETWORK_EXTENDED_QUALITIES: string[] = ['hires', 'atmos', 'atmos_plus', 'master'];
+
+/** Persisted health record for one (script | platform | quality) tier. */
+interface QualityTierHealth {
+  fails: number;
+  cooldownUntil: number;
+}
+
+/** Kept intentionally blank: tier health constants live in SourceFallbackUtil. */
+const MAX_HISTORY: number = 200;
+const MAX_SEARCH_HISTORY: number = 15;
+
+/**
+ * Persists play history and favorite songs as JSON via preferences.
+ */
+@ObservedV2
+export class MusicStoreService {
+  private static instance: MusicStoreService | undefined = undefined;
+  private store: preferences.Preferences | undefined = undefined;
+  /** Bumped on every history mutation; observable for UI refresh. */
+  @Trace public historyVersion: number = 0;
+  /** Bumped on every favorite mutation; observable for UI refresh. */
+  @Trace public favoriteVersion: number = 0;
+  @Trace public favoriteArtistVersion: number = 0;
+  @Trace public favoriteAlbumVersion: number = 0;
+  /**
+   * 收藏的**在线歌单**（平台歌单，不是本地自建）版本号。
+   *
+   * 为什么需要它：参考工程 lxmusic-harmony 的「我的」页歌单卡是
+   * 「自建歌单 | 收藏歌单」两段，我们此前缺第二段的数据源（见 MinePage 的说明）。
+   * 现在补齐：`getFavoritePlaylists()` 存 `FavoriteEntry`（id/source/name/sub/img/count），
+   * 由平台音乐页的收藏按钮写入；界面 `@Monitor('store.favoritePlaylistVersion')` 自动刷新。
+   */
+  @Trace public favoritePlaylistVersion: number = 0;
+  /** Bumped on every search history mutation; observable for UI refresh. */
+  @Trace public searchHistoryVersion: number = 0;
+  /** Bumped on every playlist mutation; observable for UI refresh. */
+  @Trace public playlistVersion: number = 0;
+  /** Invalidation only: preferences hold the sole network quality policy truth. */
+  @Trace public networkQualityVersion: number = 0;
+  /**
+   * `getPlaylists()` 的解析结果缓存（键 = {@link playlistVersion}）。
+   *
+   * 见 `getPlaylists()` 里的说明：它每次都要把整份歌单 JSON 重新 parse 并重建记录，
+   * 而 UI 侧（歌单列表、歌单详情页的封面/标题、批量操作条、播放器选歌单）
+   * 会在每一帧里调用它好几次。
+   */
+  private playlistsCache: PlaylistDto[] | undefined = undefined;
+  private playlistsCacheVersion: number = -1;
+
+  /** Process-wide singleton. */
+  public static getInstance(): MusicStoreService {
+    if (MusicStoreService.instance === undefined) {
+      MusicStoreService.instance = new MusicStoreService();
+    }
+    // Initialize outside UI getters whenever context is available (component field/startup access).
+    MusicStoreService.instance.ensureNetworkQualityPolicy(true);
+    MusicStoreService.instance.ensureNetworkQualityPolicy(false);
+    return MusicStoreService.instance;
+  }
+
+  private getStore(): preferences.Preferences | undefined {
+    if (this.store !== undefined) {
+      return this.store;
+    }
+    const ctx = getAppRuntime().context;
+    if (ctx === undefined) {
+      return undefined;
+    }
+    this.store = preferences.getPreferencesSync(ctx, { name: STORE_NAME });
+    return this.store;
+  }
+
+  private diagnosticPending: string = '';
+  private diagnosticFlushRunning: boolean = false;
+  private diagnosticDirty: boolean = false;
+
+  /** RzdRuntimeDiag: event-only diagnostics; never call from frame/ticker callbacks. */
+  public appendRuntimeDiagnostic(message: string): void {
+    const entry: string = `[${new Date().toISOString()}] ${message}\n`;
+    appendPlayLog(message);
+    console.info('[RzdRuntimeDiag] ' + message);
+    this.diagnosticPending = (this.diagnosticPending + entry).slice(-MAX_RUNTIME_DIAGNOSTICS);
+    try {
+      const store: preferences.Preferences | undefined = this.getStore();
+      if (store === undefined) {
+        console.warn('[RzdRuntimeDiag] persistence pending: context unavailable');
+        return;
+      }
+      const previous: string = store.getSync(KEY_RUNTIME_DIAGNOSTICS, '') as string;
+      const combined: string = previous + this.diagnosticPending;
+      let bounded: string = combined.slice(-MAX_RUNTIME_DIAGNOSTICS);
+      if (combined.length > MAX_RUNTIME_DIAGNOSTICS) {
+        const firstBreak: number = bounded.indexOf('\n');
+        if (firstBreak >= 0) {
+          bounded = bounded.substring(firstBreak + 1);
+        }
+      }
+      store.putSync(KEY_RUNTIME_DIAGNOSTICS, bounded);
+      this.diagnosticPending = '';
+      this.diagnosticDirty = true;
+      this.flushRuntimeDiagnostics(store);
+    } catch (err) {
+      console.error('[RzdRuntimeDiag] persistence-write-failed ' + JSON.stringify(err));
+    }
+  }
+
+  /** Serial, coalesced disk writes; a later event retries a failed flush. */
+  private async flushRuntimeDiagnostics(store: preferences.Preferences): Promise<void> {
+    if (this.diagnosticFlushRunning) {
+      return;
+    }
+    this.diagnosticFlushRunning = true;
+    try {
+      while (this.diagnosticDirty) {
+        this.diagnosticDirty = false;
+        await store.flush();
+      }
+    } catch (err) {
+      this.diagnosticDirty = true;
+      const failure: string = '[RzdRuntimeDiag] persistence-flush-failed ' + JSON.stringify(err);
+      appendPlayLog(failure);
+      console.error(failure);
+    } finally {
+      this.diagnosticFlushRunning = false;
+    }
+  }
+
+  public getRuntimeDiagnostics(): string {
+    try {
+      const store: preferences.Preferences | undefined = this.getStore();
+      const persisted: string = store === undefined ? '' : store.getSync(KEY_RUNTIME_DIAGNOSTICS, '') as string;
+      return (persisted + this.diagnosticPending).slice(-MAX_RUNTIME_DIAGNOSTICS);
+    } catch (err) {
+      return '[RzdRuntimeDiag] persistence-read-failed ' + JSON.stringify(err);
+    }
+  }
+
+  /** Backup restore completion barrier: propagate persistence failures to the caller. */
+  public async flushPendingWrites(): Promise<void> {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      throw new Error('音乐存储未初始化');
+    }
+    await store.flush();
+  }
+
+  private readList(key: string): PlayedSongRecord[] {
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const text: string = store.getSync(key, '[]') as string;
+    try {
+      const list: PlayedSongRecord[] = JSON.parse(text) as PlayedSongRecord[];
+      return list !== undefined ? list : [];
+    } catch (_err) {
+      return [];
+    }
+  }
+
+  private writeList(key: string, list: PlayedSongRecord[]): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(key, JSON.stringify(list));
+    store.flush();
+  }
+
+  /** @returns Play history, most recent first. */
+  public getHistory(): PlayedSongRecord[] {
+    return this.readList(KEY_HISTORY);
+  }
+
+  /** Records a played song: dedupe by source+songId and move to front, capped at MAX_HISTORY. */
+  public addHistory(record: PlayedSongRecord): void {
+    const list: PlayedSongRecord[] = this.getHistory();
+    const id: string = record.source + '_' + record.songId;
+    const kept: PlayedSongRecord[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].source + '_' + list[i].songId !== id) {
+        kept.push(list[i]);
+      }
+    }
+    kept.unshift(record);
+    if (kept.length > MAX_HISTORY) {
+      kept.splice(MAX_HISTORY, kept.length - MAX_HISTORY);
+    }
+    this.writeList(KEY_HISTORY, kept);
+    this.historyVersion++;
+  }
+
+  /** Clears all play history. */
+  public clearHistory(): void {
+    this.writeList(KEY_HISTORY, []);
+    this.historyVersion++;
+  }
+
+  /** Removes the given history entries (ids are source_songId keys). */
+  public removeHistoryByIds(ids: string[]): void {
+    const list: PlayedSongRecord[] = this.getHistory();
+    const removeSet: Set<string> = new Set(ids);
+    const kept: PlayedSongRecord[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (!removeSet.has(list[i].source + '_' + list[i].songId)) {
+        kept.push(list[i]);
+      }
+    }
+    this.writeList(KEY_HISTORY, kept);
+    this.historyVersion++;
+  }
+
+  /** @returns Favorite songs, most recently added first. */
+  public getFavorites(): PlayedSongRecord[] {
+    return this.readList(KEY_FAVORITES);
+  }
+
+  /**
+   * In-place updates the quality field of an existing history entry (keeps the row in its
+   * current position). No-op when the entry is not found.
+   */
+  public refreshHistoryQuality(source: string, songId: string, quality: string): void {
+    const list: PlayedSongRecord[] = this.getHistory();
+    let changed: boolean = false;
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].source === source && list[i].songId === songId) {
+        if (list[i].quality !== quality) {
+          list[i].quality = quality;
+          changed = true;
+        }
+        break;
+      }
+    }
+    if (changed) {
+      this.writeList(KEY_HISTORY, list);
+      this.historyVersion++;
+    }
+  }
+
+  /**
+   * In-place updates the quality field of an existing favorite entry (keeps the row in its
+   * current position). No-op when the entry is not found.
+   */
+  public refreshFavoriteQuality(source: string, songId: string, quality: string): void {
+    const list: PlayedSongRecord[] = this.getFavorites();
+    let changed: boolean = false;
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].source === source && list[i].songId === songId) {
+        if (list[i].quality !== quality) {
+          list[i].quality = quality;
+          changed = true;
+        }
+        break;
+      }
+    }
+    if (changed) {
+      this.writeList(KEY_FAVORITES, list);
+      this.favoriteVersion++;
+    }
+  }
+
+  /** One durable write, stable dedupe, and exactly one library-version notification. */
+  public async addFavorites(records: PlayedSongRecord[]): Promise<number> {
+    const store = this.getStore();
+    if (store === undefined) {
+      throw new Error('收藏存储不可用');
+    }
+    const before: PlayedSongRecord[] = this.getFavorites();
+    const ids: Set<string> = new Set<string>();
+    for (const item of before) {
+      ids.add(item.source + '_' + item.songId);
+    }
+    const added: PlayedSongRecord[] = [];
+    for (const record of records) {
+      const id: string = record.source + '_' + record.songId;
+      if (!ids.has(id)) {
+        ids.add(id);
+        added.push(record);
+      }
+    }
+    if (added.length === 0) {
+      return 0;
+    }
+    const oldText: string = store.getSync(KEY_FAVORITES, '[]') as string;
+    store.putSync(KEY_FAVORITES, JSON.stringify(added.concat(before)));
+    try {
+      await store.flush();
+    } catch (error) {
+      store.putSync(KEY_FAVORITES, oldText);
+      throw new Error('批量收藏持久化失败：' + (error as Error).message);
+    }
+    this.favoriteVersion++;
+    return added.length;
+  }
+
+  /** Adds a song to favorites (dedupe by source+songId). */
+  public addFavorite(record: PlayedSongRecord): void {
+    const list: PlayedSongRecord[] = this.getFavorites();
+    const id: string = record.source + '_' + record.songId;
+    const kept: PlayedSongRecord[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].source + '_' + list[i].songId !== id) {
+        kept.push(list[i]);
+      }
+    }
+    kept.unshift(record);
+    this.writeList(KEY_FAVORITES, kept);
+    this.favoriteVersion++;
+  }
+
+  /** Removes a song from favorites by source and songId. */
+  public removeFavorite(source: string, songId: string): void {
+    const id: string = source + '_' + songId;
+    const list: PlayedSongRecord[] = this.getFavorites();
+    const kept: PlayedSongRecord[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].source + '_' + list[i].songId !== id) {
+        kept.push(list[i]);
+      }
+    }
+    this.writeList(KEY_FAVORITES, kept);
+    this.favoriteVersion++;
+  }
+
+  /** @returns The persisted ambient level (0=follow system, 1=weak, 2=balanced, 3=strong). */
+  public getAmbientLevel(): number {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 0;
+    }
+    const v = store.getSync(KEY_AMBIENT_LEVEL, 0) as number;
+    if (v >= 0 && v <= 3) {
+      return v;
+    }
+    return 0;
+  }
+
+  /** Persists the ambient level (0-3). */
+  public setAmbientLevel(level: number): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_AMBIENT_LEVEL, level);
+    store.flush();
+  }
+
+  /** @returns The persisted lyrics page render frame rate; default 60 FPS. */
+  public getLyricFps(): number {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 60;
+    }
+    const v = store.getSync(KEY_LYRIC_FPS, 60) as number;
+    return (v === 60 || v === 90 || v === 120 || v === 144) ? v : 60;
+  }
+
+  /** Persists the lyrics page render frame rate (60/90/120/144/165). */
+  public setLyricFps(fps: number): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_LYRIC_FPS, fps);
+    store.flush();
+  }
+
+  /** @returns Whether lyric lines render center-aligned; duet lines always keep left/right. */
+  public getLyricCenterEnabled(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_LYRIC_CENTER, false) as boolean;
+  }
+
+  /** Persists whether lyric lines render center-aligned. */
+  public setLyricCenterEnabled(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_LYRIC_CENTER, enabled);
+    store.flush();
+  }
+
+  /**
+   * @returns Whether a failed playback may automatically switch to another user
+   * source script to find the song. Enabled by default to keep the historical
+   * cross-script recovery behaviour.
+   */
+
+  /**
+   * 参与「播放失败依次换音源」的脚本 id 顺序（用户可多选并手动排序）。
+   * 空数组表示未配置：回退为全部已导入脚本的当前列表顺序。
+   */
+  public getSourceScriptOrder(): string[] {
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const raw: string = store.getSync(KEY_SOURCE_SCRIPT_ORDER, '') as string;
+    if (raw.length === 0) {
+      return [];
+    }
+    try {
+      const arr: Object = JSON.parse(raw) as Object;
+      if (!Array.isArray(arr)) {
+        return [];
+      }
+      const out: string[] = [];
+      for (let i: number = 0; i < (arr as Object[]).length; i++) {
+        const id: string = String((arr as Object[])[i] ?? '');
+        if (id.length > 0 && out.indexOf(id) < 0) {
+          out.push(id);
+        }
+      }
+      return out;
+    } catch (_e) {
+      return [];
+    }
+  }
+
+  public setSourceScriptOrder(ids: string[]): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    const cleaned: string[] = [];
+    for (let i: number = 0; i < ids.length; i++) {
+      if (ids[i].length > 0 && cleaned.indexOf(ids[i]) < 0) {
+        cleaned.push(ids[i]);
+      }
+    }
+    store.putSync(KEY_SOURCE_SCRIPT_ORDER, JSON.stringify(cleaned));
+    store.flush();
+  }
+
+  public getCrossScriptFallback(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return true;
+    }
+    return store.getSync(KEY_CROSS_SCRIPT_FALLBACK, true) as boolean;
+  }
+
+  /** Persists whether a failed playback may automatically switch user source script. */
+  public setCrossScriptFallback(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_CROSS_SCRIPT_FALLBACK, enabled);
+    store.flush();
+  }
+
+  /**
+   * Reads the quality-tier health map. Tiers are keyed by
+   * "scriptId|source|quality" so a broken tier only affects the script/platform
+   * combination that actually failed (e.g. tx/24bit can be broken while wy/24bit works).
+   */
+  private getQualityTierMap(): Record<string, QualityTierHealth> {
+    const store = this.getStore();
+    if (store === undefined) {
+      return {};
+    }
+    const raw: string = store.getSync(KEY_QUALITY_TIER_HEALTH, '') as string;
+    if (raw.length === 0) {
+      return {};
+    }
+    try {
+      return JSON.parse(raw) as Record<string, QualityTierHealth>;
+    } catch (_err) {
+      return {};
+    }
+  }
+
+  private saveQualityTierMap(map: Record<string, QualityTierHealth>): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_QUALITY_TIER_HEALTH, JSON.stringify(map));
+    store.flush();
+  }
+
+  /** @returns Whether the home page shows the playlist plaza section; off by default. */
+  public getShowHomePlaza(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_SHOW_HOME_PLAZA, true) as boolean;
+  }
+
+  /** Persists whether the home page shows the playlist plaza section. */
+  public setShowHomePlaza(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_SHOW_HOME_PLAZA, enabled);
+    store.flush();
+  }
+
+  /** @returns Whether the home page shows the ranking boards section; off by default. */
+  public getShowHomeRanking(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_SHOW_HOME_RANKING, true) as boolean;
+  }
+
+  /** Persists whether the home page shows the ranking boards section. */
+  public setShowHomeRanking(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_SHOW_HOME_RANKING, enabled);
+    store.flush();
+  }
+
+  /** @returns True when the given health key is currently cooling down (known broken). */
+  public isCooling(key: string): boolean {
+    const entry: QualityTierHealth | undefined = this.getQualityTierMap()[key];
+    if (entry === undefined) {
+      return false;
+    }
+    return entry.cooldownUntil > Date.now();
+  }
+
+  /**
+   * Records a failure for a health key.
+   * @param key Health key (quality tier or platform-wide).
+   * @param threshold Consecutive failures that trigger cooldown.
+   * @param cooldownMs Cooldown duration once the threshold is reached.
+   */
+  public recordFailure(key: string, threshold: number, cooldownMs: number): void {
+    const map: Record<string, QualityTierHealth> = this.getQualityTierMap();
+    let entry: QualityTierHealth | undefined = map[key];
+    if (entry === undefined) {
+      entry = { fails: 0, cooldownUntil: 0 };
+    }
+    entry.fails += 1;
+    if (entry.fails >= threshold) {
+      entry.cooldownUntil = Date.now() + cooldownMs;
+    }
+    map[key] = entry;
+    this.saveQualityTierMap(map);
+  }
+
+  /** Records a success: clears the key so the tier/platform can be used again. */
+  public recordSuccess(key: string): void {
+    const map: Record<string, QualityTierHealth> = this.getQualityTierMap();
+    const entry: QualityTierHealth | undefined = map[key];
+    if (entry === undefined || (entry.fails === 0 && entry.cooldownUntil === 0)) {
+      return;
+    }
+    map[key] = { fails: 0, cooldownUntil: 0 };
+    this.saveQualityTierMap(map);
+  }
+
+  /** Clears every learned tier. */
+  public resetQualityTierHealth(): void {
+    this.saveQualityTierMap({});
+  }
+
+  /** @returns Whether the lyrics page applies blur to non-active lines; default false. */
+  public getLyricBlurEnabled(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_LYRIC_BLUR, false) as boolean;
+  }
+
+  /** Persists the lyrics page blur-effect toggle. */
+  public setLyricBlurEnabled(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_LYRIC_BLUR, enabled);
+    store.flush();
+  }
+
+  /** @returns The persisted lyrics font size (active line); default 28, clamped 18..44. */
+  public getLyricFontSize(): number {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 28;
+    }
+    const size = store.getSync(KEY_LYRIC_FONT_SIZE, 28) as number;
+    if (typeof size !== 'number' || isNaN(size) || size < 18 || size > 44) {
+      return 28;
+    }
+    return size;
+  }
+
+  /** Persists the lyrics font size (active line), clamped 18..44. */
+  public setLyricFontSize(size: number): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    const clamped: number = Math.max(18, Math.min(44, size));
+    store.putSync(KEY_LYRIC_FONT_SIZE, clamped);
+    store.flush();
+  }
+
+  /** @returns The persisted theme color; default red #E60012. */
+  public getThemeColor(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '#E60012';
+    }
+    const c = store.getSync(KEY_THEME_COLOR, '#E60012') as string;
+    return /^#[0-9a-fA-F]{6}$/.test(c) ? c : '#E60012';
+  }
+
+  /** Persists the theme color (hex string). */
+  public setThemeColor(color: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_THEME_COLOR, color);
+    store.flush();
+  }
+
+  /** @returns The persisted home recommendation source id; default 'qq'. */
+  public getHomeSource(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 'qq';
+    }
+    const s = store.getSync(KEY_HOME_SOURCE, 'qq') as string;
+    return s.length > 0 ? s : 'qq';
+  }
+
+  /** Persists the home recommendation source id ('qq'|'kg'|'wy'|'mg'). */
+  public setHomeSource(source: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_HOME_SOURCE, source);
+    store.flush();
+  }
+
+  /** @returns Whether the playback page shows mini lyric lines below the cover. */
+  public getShowMiniLyric(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+
+    return store.getSync(KEY_SHOW_MINI_LYRIC, false) as boolean;
+  }
+
+  /** 仅供旧备份/云同步兼容读取；播放页已固定为网格背景。 */
+  public getPlaybackFlowLight(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_PLAYBACK_FLOW_LIGHT, false) as boolean;
+  }
+
+  /** 仅供旧备份/云同步兼容写入；播放页已固定为网格背景。 */
+  public setPlaybackFlowLight(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAYBACK_FLOW_LIGHT, enabled);
+    store.flush();
+  }
+
+  /**
+   * 是否允许**锁屏/后台继续播放**（默认 **开**）。
+   *
+   * 语义：开 = 播放时申请"音频后台长时任务"，息屏/锁屏/切到后台都继续放；
+   * 关 = 不加长时任务，退到后台由系统按普通应用处理（听感上就是"锁屏就停"）。
+   *
+   * ⚠️ 读不到存储时**返回 true**（不是 false）：老用户装机没有这条记录，
+   *   按"开"处理才不会一升级就丢锁屏播放。
+   * @returns True = 允许锁屏/后台继续播放
+   */
+  public getLockScreenPlay(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return true;
+    }
+    return store.getSync(KEY_LOCK_SCREEN_PLAY, true) as boolean;
+  }
+
+  /**
+   * 持久化「锁屏播放」开关。
+   * @param enabled True = 允许锁屏/后台继续播放
+   */
+  public setLockScreenPlay(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_LOCK_SCREEN_PLAY, enabled);
+    this.appendRuntimeDiagnostic(`[RzdLockscreen] lockscreen enabled=${enabled} event=setting-write`);
+  }
+
+  /** Whether the lyrics/playback page keeps the screen on. */
+  public getKeepScreenOn(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_KEEP_SCREEN_ON, false) as boolean;
+  }
+
+  /** Persists the keep-screen-on switch. */
+  public setKeepScreenOn(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_KEEP_SCREEN_ON, enabled);
+    store.flush();
+  }
+
+  /** Whether downloaded file names include the quality tag. */
+  /** 自定义下载目录（用户通过目录选择器选的 uri；空 = 用系统下载目录）。 */
+  /** 自定义软件图标变体（default/blue/green/purple/orange/dark）。 */
+  /** Apple Music amp-api 的 Bearer token（自动抓取后缓存，约 70 天有效）。 */
+  public getConcertToken(): string {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_CONCERT_TOKEN, '') as string;
+  }
+
+  public setConcertToken(token: string): void {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_CONCERT_TOKEN, token);
+    store.putSync(KEY_CONCERT_TOKEN_AT, Date.now());
+    store.flush();
+  }
+
+  /** token 写入时间（毫秒）。 */
+  public getConcertTokenAt(): number {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      return 0;
+    }
+    return store.getSync(KEY_CONCERT_TOKEN_AT, 0) as number;
+  }
+  public getAppIconVariant(): string {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      return 'default';
+    }
+    return store.getSync(KEY_APP_ICON_VARIANT, 'default') as string;
+  }
+
+  public setAppIconVariant(variant: string): void {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_APP_ICON_VARIANT, variant);
+    store.flush();
+  }
+  public getDownloadDirUri(): string {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_DOWNLOAD_DIR_URI, '') as string;
+  }
+
+  public setDownloadDirUri(uri: string): void {
+    const store: preferences.Preferences | undefined = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_DOWNLOAD_DIR_URI, uri);
+    store.flush();
+  }
+
+  public getDownloadQualityTag(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_DOWNLOAD_QUALITY_TAG, false) as boolean;
+  }
+
+  /** Persists the download quality-tag switch. */
+  public setDownloadQualityTag(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_DOWNLOAD_QUALITY_TAG, enabled);
+    store.flush();
+  }
+
+  /** @returns Persisted download task queue JSON (survives restarts). */
+  public getDownloadTasks(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '[]';
+    }
+    return store.getSync(KEY_DOWNLOAD_TASKS, '[]') as string;
+  }
+
+  /** Persists the download task queue JSON. */
+  public setDownloadTasks(json: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_DOWNLOAD_TASKS, json);
+    store.flush();
+  }
+
+  /** @returns Whether the home recommendation uses the logged-in account's daily picks; default false. */
+  public getUseAccountRec(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_USE_ACCOUNT_REC, false) as boolean;
+  }
+
+  /** Persists the use-login-account-recommendation switch. */
+  public setUseAccountRec(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_USE_ACCOUNT_REC, enabled);
+    store.flush();
+  }
+
+  /** Persists the playback-page mini lyric switch. */
+  public setShowMiniLyric(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_SHOW_MINI_LYRIC, enabled);
+    store.flush();
+  }
+
+  /**
+   * @returns 桌面歌词（系统悬浮窗歌词）开关，默认**关**。
+   *
+   * 默认关：`enableDesktopLyric` 在部分机型上会顺带要悬浮窗授权，
+   * 用户没主动开就不该被弹窗打扰（要显示歌词的地方，播控中心 / 锁屏本来就有）。
+   */
+  public getDesktopLyric(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_DESKTOP_LYRIC, false) as boolean;
+  }
+
+  /** 持久化桌面歌词开关。 */
+  public setDesktopLyric(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_DESKTOP_LYRIC, enabled);
+    store.flush();
+  }
+
+  /**
+   * @returns 车载蓝牙歌词开关，默认**关**。
+   * 开启后通过 AVMetadata.singleLyricText 向车机/蓝牙音箱推送当前歌词句；
+   * 部分设备可能因此略增卡顿，故与洛雪一致默认关闭。
+   */
+  public getBluetoothLyric(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_BLUETOOTH_LYRIC, false) as boolean;
+  }
+
+  /** 持久化车载蓝牙歌词开关。 */
+  public setBluetoothLyric(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_BLUETOOTH_LYRIC, enabled);
+    store.flush();
+  }
+
+  /** @returns 华为账号登录资料的 JSON（没登录过返回空串）。 */
+  public getHuaweiAccount(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_HUAWEI_ACCOUNT, '') as string;
+  }
+
+  /** 保存 / 清除华为账号登录资料（传空串 = 退出登录）。 */
+  public setHuaweiAccount(json: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_HUAWEI_ACCOUNT, json);
+    store.flush();
+  }
+
+  /** @returns 华为云盘访问令牌的 JSON（没连接过返回空串）。 */
+  public getHuaweiDriveToken(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_HUAWEI_DRIVE_TOKEN, '') as string;
+  }
+
+  /** 保存华为云盘令牌（传空串 = 断开）。 */
+  public setHuaweiDriveToken(json: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_HUAWEI_DRIVE_TOKEN, json);
+    store.flush();
+  }
+
+  /** @returns 歌单的原始 JSON（云备份/恢复用，与 preferences 里存的是同一份格式）。 */
+  public playlistsJson(): string {
+    return JSON.stringify(this.getPlaylists());
+  }
+
+  /**
+   * 用一份原始 JSON 覆盖歌单（云恢复用）。
+   *
+   * 解析失败就原样不动现有数据、返回 false —— 恢复是「要么完整生效、要么不生效」，
+   * 不做半截写入。
+   */
+  public replacePlaylistsJson(json: string): boolean {
+    const store = this.getStore();
+    if (store === undefined || json.length === 0) {
+      return false;
+    }
+    try {
+      const list: Object[] = JSON.parse(json) as Object[];
+      if (!Array.isArray(list)) {
+        return false;
+      }
+      store.putSync(KEY_PLAYLISTS, json);
+      store.flush();
+      this.playlistVersion++;
+      return true;
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  /** @returns Playback page cover corner radius in vp; default 8. */
+  public getCoverCornerRadius(): number {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 8;
+    }
+    const v: number = store.getSync(KEY_COVER_CORNER_RADIUS, 8) as number;
+    return v >= 0 && v <= 48 ? v : 8;
+  }
+
+  /** Persists the playback page cover corner radius (vp). */
+  public setCoverCornerRadius(radius: number): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_COVER_CORNER_RADIUS, radius);
+    store.flush();
+  }
+
+  /** @returns Whether the playback page extends into the status bar (full screen); default false. */
+  public getPlaybackFullscreen(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_PLAYBACK_FULLSCREEN, false) as boolean;
+  }
+
+  /** Persists the playback page full-screen (status-bar immersive) switch. */
+  public setPlaybackFullscreen(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAYBACK_FULLSCREEN, enabled);
+    store.flush();
+  }
+
+  /** @returns Whether downloads write a standalone .lrc next to the audio; default true. */
+  public getDownloadLrc(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return true;
+    }
+    return store.getSync(KEY_DOWNLOAD_LRC, true) as boolean;
+  }
+
+  /** Persists the standalone .lrc download switch. */
+  public setDownloadLrc(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_DOWNLOAD_LRC, enabled);
+    store.flush();
+  }
+
+  /** @returns The .lrc text encoding for downloads: 'utf8' or 'gbk'; default 'utf8'. */
+  public getDownloadLrcEncoding(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 'utf8';
+    }
+    const v: string = store.getSync(KEY_DOWNLOAD_LRC_ENCODING, 'utf8') as string;
+    return v === 'gbk' ? 'gbk' : 'utf8';
+  }
+
+  /** Persists the .lrc text encoding for downloads. */
+  public setDownloadLrcEncoding(encoding: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_DOWNLOAD_LRC_ENCODING, encoding === 'gbk' ? 'gbk' : 'utf8');
+    store.flush();
+  }
+
+  /** @returns Whether the lyrics page shows translation/romanization sub-lines. */
+  public getShowSubLyric(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return true;
+    }
+    return store.getSync(KEY_SHOW_SUB_LYRIC, true) as boolean;
+  }
+
+  /** Persists the lyrics-page translation/romanization switch. */
+  public setShowSubLyric(show: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_SHOW_SUB_LYRIC, show);
+    store.flush();
+  }
+
+  /**
+   * 显示歌词翻译（对齐 lx player.isShowLyricTranslation）。
+   * 默认跟随历史 showSubLyric；若单独存过则用单独值。
+   */
+  public getShowLyricTranslation(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return true;
+    }
+    // 未单独配置时跟随历史 showSubLyric
+    return store.getSync(KEY_SHOW_LYRIC_TRANSLATION,
+      store.getSync(KEY_SHOW_SUB_LYRIC, true)) as boolean;
+  }
+
+  public setShowLyricTranslation(show: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_SHOW_LYRIC_TRANSLATION, show);
+    // 兼容：任一子开关开启则 showSubLyric 为 true
+    const roma: boolean = this.getShowLyricRoma();
+    store.putSync(KEY_SHOW_SUB_LYRIC, show || roma);
+    store.flush();
+  }
+
+  /**
+   * 显示歌词罗马音（对齐 lx player.isShowLyricRoma）。
+   * 目前主要网易源有罗马音。
+   */
+  public getShowLyricRoma(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return true;
+    }
+    return store.getSync(KEY_SHOW_LYRIC_ROMA,
+      store.getSync(KEY_SHOW_SUB_LYRIC, true)) as boolean;
+  }
+
+  public setShowLyricRoma(show: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_SHOW_LYRIC_ROMA, show);
+    const trans: boolean = this.getShowLyricTranslation();
+    store.putSync(KEY_SHOW_SUB_LYRIC, show || trans);
+    store.flush();
+  }
+
+  /**
+   * 将播放的中文歌词转为繁体（对齐 lx player.isS2t）。默认关闭。
+   */
+  public getLyricS2t(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_LYRIC_S2T, false) as boolean;
+  }
+
+  public setLyricS2t(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_LYRIC_S2T, enabled);
+    store.flush();
+  }
+
+  private networkQualityKey(wifi: boolean): string {
+    return wifi ? 'play_quality_wifi' : 'play_quality_cellular';
+  }
+
+  /** Fill missing policy fields only. An established network tier always outranks legacy global. */
+  private ensureNetworkQualityPolicy(wifi: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    const key: string = this.networkQualityKey(wifi);
+    if (store.hasSync(key + '_base') && store.hasSync(key + '_extended') &&
+      store.hasSync(key + '_extended_enabled')) {
+      return;
+    }
+    let tier: string = '320k';
+    if (store.hasSync(key)) {
+      tier = store.getSync(key, '320k') as string;
+    } else {
+      // Historical migration only; never read this global policy during normal resolution/download.
+      const extended: string = this.getPlayExtendedQuality();
+      tier = this.getPlayExtendedEnabled() && NETWORK_EXTENDED_QUALITIES.includes(extended) ?
+        extended : this.getPlayQuality();
+    }
+    const isExtended: boolean = NETWORK_EXTENDED_QUALITIES.includes(tier);
+    if (!store.hasSync(key + '_base')) {
+      store.putSync(key + '_base', NETWORK_BASE_QUALITIES.includes(tier) ? tier : '320k');
+    }
+    if (!store.hasSync(key + '_extended')) {
+      store.putSync(key + '_extended', isExtended ? tier : 'hires');
+    }
+    if (!store.hasSync(key + '_extended_enabled')) {
+      store.putSync(key + '_extended_enabled', isExtended);
+    }
+    // Compatibility output only, never a second policy input after migration.
+    this.persistNetworkEffective(wifi, 'migrate');
+  }
+
+  public getNetworkBaseQuality(wifi: boolean): string {
+    const version: number = this.networkQualityVersion;
+    this.ensureNetworkQualityPolicy(wifi);
+    const store = this.getStore();
+    const value: string = store === undefined ? '320k' :
+      store.getSync(this.networkQualityKey(wifi) + '_base', '320k') as string;
+    return NETWORK_BASE_QUALITIES.includes(value) ? value : '320k';
+  }
+
+  public getNetworkExtendedQuality(wifi: boolean): string {
+    const version: number = this.networkQualityVersion;
+    this.ensureNetworkQualityPolicy(wifi);
+    const store = this.getStore();
+    const value: string = store === undefined ? 'hires' :
+      store.getSync(this.networkQualityKey(wifi) + '_extended', 'hires') as string;
+    return NETWORK_EXTENDED_QUALITIES.includes(value) ? value : 'hires';
+  }
+
+  public getNetworkExtendedEnabled(wifi: boolean): boolean {
+    const version: number = this.networkQualityVersion;
+    this.ensureNetworkQualityPolicy(wifi);
+    const store = this.getStore();
+    return store !== undefined && store.getSync(this.networkQualityKey(wifi) + '_extended_enabled', false) === true;
+  }
+
+  public getNetworkPlayQuality(wifi: boolean): string {
+    return this.getNetworkExtendedEnabled(wifi) ? this.getNetworkExtendedQuality(wifi) :
+      this.getNetworkBaseQuality(wifi);
+  }
+
+  private persistNetworkEffective(wifi: boolean, reason: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    const key: string = this.networkQualityKey(wifi);
+    const enabled: boolean = store.getSync(key + '_extended_enabled', false) === true;
+    const base: string = store.getSync(key + '_base', '320k') as string;
+    const extended: string = store.getSync(key + '_extended', 'hires') as string;
+    const effective: string = enabled ? extended : base;
+    store.putSync(key, effective);
+    this.networkQualityVersion++;
+    console.info('[RzdQualityPolicy] network config reason=' + reason + ' key=' + key +
+      ' enabled=' + enabled + ' base=' + base + ' extension=' + extended + ' effective=' + effective);
+    store.flush().catch((): void => {
+      console.error('[RzdQualityPolicy] network config flush failed key=' + key);
+    });
+  }
+
+  public setNetworkBaseQuality(wifi: boolean, quality: string): void {
+    if (!NETWORK_BASE_QUALITIES.includes(quality)) {
+      return;
+    }
+    this.ensureNetworkQualityPolicy(wifi);
+    const store = this.getStore();
+    if (store !== undefined) {
+      store.putSync(this.networkQualityKey(wifi) + '_base', quality);
+      this.persistNetworkEffective(wifi, 'base');
+    }
+  }
+
+  public setNetworkExtendedQuality(wifi: boolean, quality: string): void {
+    if (!NETWORK_EXTENDED_QUALITIES.includes(quality)) {
+      return;
+    }
+    this.ensureNetworkQualityPolicy(wifi);
+    const store = this.getStore();
+    if (store !== undefined) {
+      store.putSync(this.networkQualityKey(wifi) + '_extended', quality);
+      this.persistNetworkEffective(wifi, 'extension');
+    }
+  }
+
+  public setNetworkExtendedEnabled(wifi: boolean, enabled: boolean): void {
+    this.ensureNetworkQualityPolicy(wifi);
+    const store = this.getStore();
+    if (store !== undefined) {
+      store.putSync(this.networkQualityKey(wifi) + '_extended_enabled', enabled);
+      this.persistNetworkEffective(wifi, 'switch');
+    }
+  }
+
+  /** Explicit player/old backup selection atomically changes only this network's active group. */
+  public setNetworkPlayQuality(wifi: boolean, quality: string): void {
+    const extended: boolean = NETWORK_EXTENDED_QUALITIES.includes(quality);
+    if (!extended && !NETWORK_BASE_QUALITIES.includes(quality)) {
+      return;
+    }
+    this.ensureNetworkQualityPolicy(wifi);
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    const key: string = this.networkQualityKey(wifi);
+    store.putSync(key + (extended ? '_extended' : '_base'), quality);
+    store.putSync(key + '_extended_enabled', extended);
+    this.persistNetworkEffective(wifi, 'explicit');
+  }
+
+  public getWebDavConfig(): string {
+    const store = this.getStore();
+    return store === undefined ? '' : store.getSync('webdav_config', '') as string;
+  }
+
+  public setWebDavConfig(value: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync('webdav_config', value);
+    store.flush();
+  }
+
+  /** @returns The persisted playback quality; default '128k'. */
+  public getPlayQuality(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '128k';
+    }
+    const q = store.getSync(KEY_PLAY_QUALITY, '128k') as string;
+    return q.length > 0 ? q : '128k';
+  }
+
+  /** Persists the playback quality ('128k'|'320k'|'flac'|'flac24bit'). */
+  public setPlayQuality(quality: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAY_QUALITY, quality);
+    // Legacy backup field only. Never overwrite established per-network preferences.
+    store.flush();
+  }
+
+  /** 拓展音质档位（hires/atmos/atmos_plus/master），空 = 未选择。 */
+  public getPlayExtendedQuality(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_PLAY_EXTENDED_QUALITY, '') as string;
+  }
+
+  public setPlayExtendedQuality(quality: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAY_EXTENDED_QUALITY, quality);
+    store.flush();
+  }
+
+  /** 拓展音质开关：开启时优先尝试所选拓展音质。 */
+  public getPlayExtendedEnabled(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_PLAY_EXTENDED_ENABLED, false) as boolean;
+  }
+
+  public setPlayExtendedEnabled(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAY_EXTENDED_ENABLED, enabled);
+    store.flush();
+  }
+
+  /** @returns The persisted play mode (0=SINGLE_CYCLE, 1=ORDER, 2=RANDOM); default 1. */
+  public getPlayMode(): number {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 1;
+    }
+    return store.getSync(KEY_PLAY_MODE, 1) as number;
+  }
+
+  /** Persists the play mode so it survives app restarts. */
+  public setPlayMode(mode: number): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAY_MODE, mode);
+    store.flush();
+  }
+
+  /** @returns The serialized last played song record, or '' when none saved. */
+  /**
+   * Lets another process (the desktop-card form ability) open the same preferences
+   * file, so cards can read the playback snapshot and register their form ids.
+   */
+  public attachContext(ctx: Context): void {
+    try {
+      this.store = preferences.getPreferencesSync(ctx, { name: STORE_NAME });
+    } catch (_err) {
+      this.store = undefined;
+    }
+  }
+
+  /**
+   * Drops the in-memory preferences cache and re-reads the file, so values written by
+   * the other process (form ability / UI ability) become visible.
+   */
+  public refreshStoreCache(ctx: Context): void {
+    try {
+      preferences.removePreferencesFromCacheSync(ctx, { name: STORE_NAME });
+    } catch (_err) {
+    }
+    this.attachContext(ctx);
+  }
+
+  /** Registers a desktop-card form id so the app can push updates to it. */
+  public addCardFormId(formId: string): void {
+    const list: string[] = this.getCardFormIds();
+    if (list.indexOf(formId) >= 0) {
+      return;
+    }
+    list.push(formId);
+    this.putStringList(KEY_CARD_FORM_IDS, list);
+  }
+
+  /** Removes a desktop-card form id. */
+  public removeCardFormId(formId: string): void {
+    const list: string[] = this.getCardFormIds();
+    const kept: string[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i] !== formId) {
+        kept.push(list[i]);
+      }
+    }
+    this.putStringList(KEY_CARD_FORM_IDS, kept);
+  }
+
+  /** @returns All live desktop-card form ids. */
+  public getCardFormIds(): string[] {
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const text: string = store.getSync(KEY_CARD_FORM_IDS, '[]') as string;
+    try {
+      return JSON.parse(text) as string[];
+    } catch (_err) {
+      return [];
+    }
+  }
+
+  private putStringList(key: string, list: string[]): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(key, JSON.stringify(list));
+    store.flush();
+  }
+
+  /** @returns The last known playback state for the desktop card. */
+  public getCardPlaying(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_CARD_PLAYING, false) as boolean;
+  }
+
+  /** Persists the playback state shown on the desktop card. */
+  public setCardPlaying(playing: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_CARD_PLAYING, playing);
+    store.flush();
+  }
+
+  /** @returns The lyric line currently shown on the desktop card. */
+  public getCardLyric(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_CARD_LYRIC, '') as string;
+  }
+
+  /** Persists the lyric line shown on the desktop card. */
+  public setCardLyric(lyric: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_CARD_LYRIC, lyric);
+  }
+
+  /** Queues a desktop-card action (playPause/next/previous) for the app to run on resume. */
+  public setPendingCardAction(action: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_CARD_PENDING_ACTION, action);
+    store.flush();
+  }
+
+  /** Reads and clears the queued desktop-card action. */
+  public consumePendingCardAction(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    const action: string = store.getSync(KEY_CARD_PENDING_ACTION, '') as string;
+    if (action.length > 0) {
+      store.putSync(KEY_CARD_PENDING_ACTION, '');
+      store.flush();
+    }
+    return action;
+  }
+
+  /** @returns The last played record (used by the desktop card snapshot). */
+  public getLastRecord(): PlayedSongRecord | undefined {
+    const json: string = this.getLastSong();
+    if (json.length === 0) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(json) as PlayedSongRecord;
+    } catch (_err) {
+      return undefined;
+    }
+  }
+
+  public getLastSong(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_LAST_SONG, '') as string;
+  }
+
+  /** Persists the last played song record as JSON for restore-on-startup. */
+  public setLastSong(json: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_LAST_SONG, json);
+    store.flush();
+  }
+
+  /** @returns The serialized play queue snapshot, or '' when none saved. */
+  public getLastQueue(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    return store.getSync(KEY_LAST_QUEUE, '') as string;
+  }
+
+  /** Persists the full play queue snapshot (online items + local ids + index) for restore-on-startup. */
+  public setLastQueue(json: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_LAST_QUEUE, json);
+    store.flush();
+  }
+
+  /** @returns Color mode: 0=light, 1=dark, 2=follow system; default 2. */
+  public getColorMode(): number {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 2;
+    }
+    return store.getSync(KEY_COLOR_MODE, 2) as number;
+  }
+
+  /** Persists the color mode (0=light, 1=dark, 2=follow system). */
+  public setColorMode(mode: number): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_COLOR_MODE, mode);
+    store.flush();
+  }
+
+  /** @returns Whether playback mixes with other apps (shared audio focus). */
+  /** 启动应用是否自动开始播放（默认关）。 */
+  public getAutoPlayOnLaunch(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_AUTOPLAY_ON_LAUNCH, false) as boolean;
+  }
+
+  public setAutoPlayOnLaunch(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_AUTOPLAY_ON_LAUNCH, enabled);
+  }
+
+
+    /** ★ 播放设置：升降调半音数（-12~+12，0=原调）。 */
+    public getTuningPitch(): number {
+      const store = this.getStore();
+      if (store === undefined) {
+        return 0;
+      }
+      return store.getSync(KEY_TUNING_PITCH, 0) as number;
+    }
+
+    public setTuningPitch(semitones: number): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_TUNING_PITCH, semitones);
+    }
+
+    /** ★ 播放设置：5 段均衡器增益（dB，-12~+12），默认全 0。 */
+    public getEqGains(): number[] {
+      const store = this.getStore();
+      const fallback: number[] = [0, 0, 0, 0, 0];
+      if (store === undefined) {
+        return fallback;
+      }
+      const raw: string = store.getSync(KEY_TUNING_EQ, '') as string;
+      if (raw.length === 0) {
+        return fallback;
+      }
+      try {
+        const parsed: number[] = JSON.parse(raw) as number[];
+        if (Array.isArray(parsed) && parsed.length === 5) {
+          return parsed;
+        }
+      } catch (err) {
+      }
+      return fallback;
+    }
+
+    /** @returns Tab 栏配置 JSON（空串=默认：两个都显示、现在就听在前）。 */
+    public getTabBarConfig(): string {
+      const store = this.getStore();
+      if (store === undefined) {
+        return '';
+      }
+      return store.getSync(KEY_TAB_BAR_CONFIG, '') as string;
+    }
+
+    public setTabBarConfig(json: string): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_TAB_BAR_CONFIG, json);
+    }
+    /** @returns 是否启用 USB 独占输出（默认关）。 */
+    public getUsbExclusive(): boolean {
+      const store = this.getStore();
+      if (store === undefined) {
+        return false;
+      }
+      return store.getSync(KEY_USB_EXCLUSIVE, false) as boolean;
+    }
+
+    public setUsbExclusive(enabled: boolean): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_USB_EXCLUSIVE, enabled);
+    }
+    /** @returns 自定义 EQ 预设 JSON（由 player 的 AudioEffects 解析）。 */
+    public getEqPresets(): string {
+      const store = this.getStore();
+      if (store === undefined) {
+        return '';
+      }
+      return store.getSync(KEY_EQ_PRESETS, '') as string;
+    }
+
+    public setEqPresets(json: string): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_EQ_PRESETS, json);
+    }
+    /** @returns 屏幕方向（auto / portrait / landscape）。 */
+    public getScreenOrientation(): string {
+      const store = this.getStore();
+      if (store === undefined) {
+        return 'auto';
+      }
+      const mode: string = store.getSync(KEY_SCREEN_ORIENTATION, 'auto') as string;
+      return mode.length > 0 ? mode : 'auto';
+    }
+
+    public setScreenOrientation(mode: string): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_SCREEN_ORIENTATION, mode);
+    }
+    /** @returns 音效开关 JSON（由 player 的 AudioEffects 解析）。 */
+    public getAudioEffects(): string {
+      const store = this.getStore();
+      if (store === undefined) {
+        return '';
+      }
+      return store.getSync(KEY_AUDIO_EFFECTS, '') as string;
+    }
+
+    public setAudioEffects(json: string): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_AUDIO_EFFECTS, json);
+    }
+    /** @returns 播放内核选择（auto / av / ffmpeg）。 */
+    public getEngineMode(): string {
+      const store = this.getStore();
+      if (store === undefined) {
+        return 'auto';
+      }
+      const mode: string = store.getSync(KEY_ENGINE_MODE, 'auto') as string;
+      return mode.length > 0 ? mode : 'auto';
+    }
+
+    public setEngineMode(mode: string): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_ENGINE_MODE, mode);
+    }
+    /** @returns 汽水 FFmpeg 内核的连续失败次数。 */
+    public getIjkFailStreak(): number {
+      const store = this.getStore();
+      if (store === undefined) {
+        return 0;
+      }
+      return store.getSync(KEY_IJK_FAIL_STREAK, 0) as number;
+    }
+
+    public setIjkFailStreak(streak: number): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_IJK_FAIL_STREAK, streak);
+    }
+
+    /** @returns 是否已临时禁用 FFmpeg 内核（连续失败自动降级）。 */
+    public isIjkDisabled(): boolean {
+      const store = this.getStore();
+      if (store === undefined) {
+        return false;
+      }
+      return store.getSync(KEY_IJK_DISABLED, false) as boolean;
+    }
+
+    public setIjkDisabled(disabled: boolean): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_IJK_DISABLED, disabled);
+      if (disabled) {
+        store.putSync(KEY_IJK_FAIL_STREAK, 0);
+      }
+    }
+    public setEqGains(gains: number[]): void {
+      const store = this.getStore();
+      if (store === undefined) {
+        return;
+      }
+      store.putSync(KEY_TUNING_EQ, JSON.stringify(gains));
+    }
+
+  public getAudioMix(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return false;
+    }
+    return store.getSync(KEY_AUDIO_MIX, false) as boolean;
+  }
+
+  /** Persists the "play alongside other apps" switch. */
+  public setAudioMix(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_AUDIO_MIX, enabled);
+    store.flush();
+  }
+
+  @Trace public downloadQualityVersion: number = 0;
+
+  /** Missing/invalid historical keys migrate to follow, never the legacy global quality. */
+  public getDownloadQualityMode(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 'follow';
+    }
+    const mode = store.getSync(KEY_DOWNLOAD_QUALITY_MODE, '') as string;
+    if (mode === 'follow' || mode === 'manual') {
+      return mode;
+    }
+    store.putSync(KEY_DOWNLOAD_QUALITY_MODE, 'follow');
+    store.flush();
+    console.info('[RzdDownloadQuality] migrate mode=follow');
+    return 'follow';
+  }
+
+  public setDownloadQualityMode(mode: string): void {
+    if (mode !== 'follow' && mode !== 'manual') {
+      return;
+    }
+    const store = this.getStore();
+    if (store !== undefined) {
+      store.putSync(KEY_DOWNLOAD_QUALITY_MODE, mode);
+      store.flush();
+      this.downloadQualityVersion++;
+    }
+  }
+
+  public getDownloadManualQuality(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '320k';
+    }
+    const quality = store.getSync(KEY_DOWNLOAD_MANUAL_QUALITY, '') as string;
+    if (NETWORK_BASE_QUALITIES.includes(quality) || NETWORK_EXTENDED_QUALITIES.includes(quality)) {
+      return quality;
+    }
+    store.putSync(KEY_DOWNLOAD_MANUAL_QUALITY, '320k');
+    store.flush();
+    return '320k';
+  }
+
+  public setDownloadManualQuality(quality: string): void {
+    if (!NETWORK_BASE_QUALITIES.includes(quality) && !NETWORK_EXTENDED_QUALITIES.includes(quality)) {
+      return;
+    }
+    const store = this.getStore();
+    if (store !== undefined) {
+      store.putSync(KEY_DOWNLOAD_MANUAL_QUALITY, quality);
+      store.flush();
+      this.downloadQualityVersion++;
+    }
+  }
+
+  /**
+   * @returns 下载**导出**方式（注意：不是"存哪儿"）：
+   *  - `'download'` = 下载完再导出到系统 Download 目录（首次要授权）；
+   *  - `'ask'` = 下载完弹系统保存对话框导出。
+   *
+   * ★ 2026-10-20 修正（用户：「**不是新增保存方式**，就是无论用户选哪个，都会在私有目录留一份」）：
+   *   上一版把 `'private'` 当成第三档保存方式（还设成默认）理解错了。正确语义是
+   *   **私有目录永远留一份**（`DownloadService.keepPrivateCopy`，本地音乐靠它列出已下载的歌），
+   *   这里这个开关只决定"要不要再导出到外部一份"。
+   */
+  public getDownloadSaveMode(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 'ask';
+    }
+    const mode = store.getSync(KEY_DOWNLOAD_SAVE_MODE, 'ask') as string;
+    return mode.length > 0 ? mode : 'ask';
+  }
+
+  /** Persists the download export mode ('download'|'ask'). */
+  public setDownloadSaveMode(mode: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    // 兼容上一版误存的 'private'：映射回 'ask'（私有副本本来就是无条件留的）
+    store.putSync(KEY_DOWNLOAD_SAVE_MODE, mode === 'private' ? 'ask' : mode);
+    store.flush();
+  }
+
+  /** @returns Download file name format: 'title'|'artist_title'|'title_artist'. */
+  public getDownloadNameFormat(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 'title';
+    }
+    const format = store.getSync(KEY_DOWNLOAD_NAME_FORMAT, 'title') as string;
+    return format.length > 0 ? format : 'title';
+  }
+
+  /** Persists the download file name format. */
+  public setDownloadNameFormat(format: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_DOWNLOAD_NAME_FORMAT, format);
+    store.flush();
+  }
+
+  /** @returns Where new songs are inserted into a playlist: 'top' or 'bottom'. */
+  public getPlaylistAddPosition(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 'bottom';
+    }
+    const position = store.getSync(KEY_PLAYLIST_ADD_POSITION, 'bottom') as string;
+    return position.length > 0 ? position : 'bottom';
+  }
+
+  /** Persists the add-to-playlist position ('top'|'bottom'). */
+  public setPlaylistAddPosition(position: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAYLIST_ADD_POSITION, position);
+    store.flush();
+  }
+
+  /**
+   * @returns 是否启用「动态封面」（歌手 / 专辑 / 歌单页；**默认开**）。
+   *
+   * 语义：开关只管"要不要去解析并播放 Apple Music 的 motion artwork"。
+   * 关掉后三页立刻退回静图，`MotionCoverLayer` 连请求都不发（见那里的 `reload()`）。
+   */
+  /**
+   * @returns 「现在就听」的选择模式：0 = 常规 / 1 = 熟悉 / 2 = 探索（默认常规）。
+   */
+  /**
+   * @returns 分类 id → 被点过的次数（自建推荐算法的加权依据，JSON 存 preferences）。
+   */
+  public getFeedCategoryPlays(): Record<string, number> {
+    const store = this.getStore();
+    if (store === undefined) {
+      return {};
+    }
+    const raw: string = store.getSync(KEY_FEED_CATEGORY_PLAYS, '') as string;
+    if (raw.length === 0) {
+      return {};
+    }
+    try {
+      return JSON.parse(raw) as Record<string, number>;
+    } catch (_err) {
+      return {};
+    }
+  }
+
+  /** 记录一次"点了这个分类下的歌"（推荐算法据此提高该分类的权重）。 */
+  public addFeedCategoryPlay(categoryId: string): void {
+    if (categoryId.length === 0) {
+      return;
+    }
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    const plays: Record<string, number> = this.getFeedCategoryPlays();
+    plays[categoryId] = (plays[categoryId] ?? 0) + 1;
+    store.putSync(KEY_FEED_CATEGORY_PLAYS, JSON.stringify(plays));
+  }
+
+  public getFeedMode(): number {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 0;
+    }
+    return store.getSync(KEY_FEED_MODE, 0) as number;
+  }
+
+  /** Persists the 「现在就听」 mode. */
+  public setFeedMode(mode: number): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_FEED_MODE, mode);
+  }
+
+  public getMotionCoverEnabled(): boolean {
+    const store = this.getStore();
+    if (store === undefined) {
+      return true;
+    }
+    return store.getSync(KEY_MOTION_COVER, true) as boolean;
+  }
+
+  /** Persists the dynamic-cover switch. */
+  public setMotionCoverEnabled(enabled: boolean): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_MOTION_COVER, enabled);
+    store.flush();
+  }
+
+  /** @returns True when the song is in favorites. */
+  /** @returns Saved favorite artists (ordered, newest first). */
+  public getFavoriteArtists(): FavoriteEntry[] {
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const text: string = store.getSync(KEY_FAVORITE_ARTISTS, '[]') as string;
+    try {
+      return JSON.parse(text) as FavoriteEntry[];
+    } catch (_err) {
+      return [];
+    }
+  }
+
+  /** Adds or refreshes a favorite artist entry. */
+  public addFavoriteArtist(entry: FavoriteEntry): void {
+    const list: FavoriteEntry[] = this.getFavoriteArtists();
+    const kept: FavoriteEntry[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== entry.id || list[i].source !== entry.source) {
+        kept.push(list[i]);
+      }
+    }
+    kept.unshift(entry);
+    this.saveFavoriteEntries(KEY_FAVORITE_ARTISTS, kept);
+    this.favoriteArtistVersion++;
+  }
+
+  /** Removes a favorite artist entry. */
+  public removeFavoriteArtist(source: string, id: string): void {
+    const list: FavoriteEntry[] = this.getFavoriteArtists();
+    const kept: FavoriteEntry[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== id || list[i].source !== source) {
+        kept.push(list[i]);
+      }
+    }
+    this.saveFavoriteEntries(KEY_FAVORITE_ARTISTS, kept);
+    this.favoriteArtistVersion++;
+  }
+
+  /** @returns Whether the artist is in favorites. */
+  /**
+   * ★ 收藏 / 关注合并为一套数据（2026-10-29 用户要求）：
+   *   歌手页那颗按钮统一叫「关注」，但**数据就是 favoriteArtists**（跨平台同一位歌手只算一次），
+   *   关注页展示的也是同一份列表 —— 不再有"收藏一套、关注另一套"的分裂。
+   *   匹配口径 = 歌手名（trim 后比较）：所以从 A 平台收藏过的歌手，在 B 平台打开也显示已关注。
+   */
+  public isFollowingArtistByName(name: string): boolean {
+    const target: string = name.trim();
+    if (target.length === 0) {
+      return false;
+    }
+    const list: FavoriteEntry[] = this.getFavoriteArtists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].name.trim() === target) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** 关注（= 收藏歌手）：按名字去重，已存在就不重复加。 */
+  public followArtistByName(entry: FavoriteEntry): void {
+    const target: string = entry.name.trim();
+    if (target.length === 0) {
+      return;
+    }
+    if (this.isFollowingArtistByName(target)) {
+      return;
+    }
+    this.addFavoriteArtist(entry);
+  }
+
+  /** 取消关注：把同名歌手的所有条目一并移除（顺便清掉历史遗留的多平台重复项）。 */
+  public unfollowArtistByName(name: string): void {
+    const target: string = name.trim();
+    if (target.length === 0) {
+      return;
+    }
+    const list: FavoriteEntry[] = this.getFavoriteArtists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].name.trim() === target) {
+        this.removeFavoriteArtist(list[i].source, list[i].id);
+      }
+    }
+  }
+
+  public isFavoriteArtist(source: string, id: string): boolean {
+    const list: FavoriteEntry[] = this.getFavoriteArtists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === id && list[i].source === source) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** @returns Saved favorite albums (ordered, newest first). */
+  public getFavoriteAlbums(): FavoriteEntry[] {
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const text: string = store.getSync(KEY_FAVORITE_ALBUMS, '[]') as string;
+    try {
+      return JSON.parse(text) as FavoriteEntry[];
+    } catch (_err) {
+      return [];
+    }
+  }
+
+  /** Adds or refreshes a favorite album entry. */
+  public addFavoriteAlbum(entry: FavoriteEntry): void {
+    const list: FavoriteEntry[] = this.getFavoriteAlbums();
+    const kept: FavoriteEntry[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== entry.id || list[i].source !== entry.source) {
+        kept.push(list[i]);
+      }
+    }
+    kept.unshift(entry);
+    this.saveFavoriteEntries(KEY_FAVORITE_ALBUMS, kept);
+    this.favoriteAlbumVersion++;
+  }
+
+  /** Removes a favorite album entry. */
+  public removeFavoriteAlbum(source: string, id: string): void {
+    const list: FavoriteEntry[] = this.getFavoriteAlbums();
+    const kept: FavoriteEntry[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== id || list[i].source !== source) {
+        kept.push(list[i]);
+      }
+    }
+    this.saveFavoriteEntries(KEY_FAVORITE_ALBUMS, kept);
+    this.favoriteAlbumVersion++;
+  }
+
+  /** @returns Whether the album is in favorites. */
+  public isFavoriteAlbum(source: string, id: string): boolean {
+    const list: FavoriteEntry[] = this.getFavoriteAlbums();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === id && list[i].source === source) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** @returns 收藏的在线歌单（按收藏时间，最新在前）。 */
+  public getFavoritePlaylists(): FavoriteEntry[] {
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const text: string = store.getSync(KEY_FAVORITE_PLAYLISTS, '[]') as string;
+    try {
+      return JSON.parse(text) as FavoriteEntry[];
+    } catch (_err) {
+      return [];
+    }
+  }
+
+  /** 收藏（或刷新）一张在线歌单；同 `source` + `id` 只留一条。 */
+  public addFavoritePlaylist(entry: FavoriteEntry): void {
+    const list: FavoriteEntry[] = this.getFavoritePlaylists();
+    const kept: FavoriteEntry[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== entry.id || list[i].source !== entry.source) {
+        kept.push(list[i]);
+      }
+    }
+    kept.unshift(entry);
+    this.saveFavoriteEntries(KEY_FAVORITE_PLAYLISTS, kept);
+    this.favoritePlaylistVersion++;
+  }
+
+  /** 取消收藏一张在线歌单。 */
+  public removeFavoritePlaylist(source: string, id: string): void {
+    const list: FavoriteEntry[] = this.getFavoritePlaylists();
+    const kept: FavoriteEntry[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== id || list[i].source !== source) {
+        kept.push(list[i]);
+      }
+    }
+    this.saveFavoriteEntries(KEY_FAVORITE_PLAYLISTS, kept);
+    this.favoritePlaylistVersion++;
+  }
+
+  /** @returns 该在线歌单是否已收藏。 */
+  public isFavoritePlaylist(source: string, id: string): boolean {
+    const list: FavoriteEntry[] = this.getFavoritePlaylists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === id && list[i].source === source) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private saveFavoriteEntries(key: string, list: FavoriteEntry[]): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(key, JSON.stringify(list));
+    store.flush();
+  }
+
+  public isFavorite(source: string, songId: string): boolean {
+    const id: string = source + '_' + songId;
+    const list: PlayedSongRecord[] = this.getFavorites();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].source + '_' + list[i].songId === id) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** @returns Search keywords, most recent first. */
+  public getSearchHistory(): string[] {
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const text: string = store.getSync(KEY_SEARCH_HISTORY, '[]') as string;
+    try {
+      const list: string[] = JSON.parse(text) as string[];
+      return list !== undefined ? list : [];
+    } catch (_err) {
+      return [];
+    }
+  }
+
+  /** Records a search keyword: dedupe and move to front, capped at MAX_SEARCH_HISTORY. */
+  public addSearchHistory(keyword: string): void {
+    const text: string = keyword.trim();
+    if (text.length === 0) {
+      return;
+    }
+    const list: string[] = this.getSearchHistory();
+    const kept: string[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i] !== text) {
+        kept.push(list[i]);
+      }
+    }
+    kept.unshift(text);
+    if (kept.length > MAX_SEARCH_HISTORY) {
+      kept.splice(MAX_SEARCH_HISTORY, kept.length - MAX_SEARCH_HISTORY);
+    }
+    const store = this.getStore();
+    if (store !== undefined) {
+      store.putSync(KEY_SEARCH_HISTORY, JSON.stringify(kept));
+      store.flush();
+    }
+    this.searchHistoryVersion++;
+  }
+
+  /** Clears all search history. */
+  public clearSearchHistory(): void {
+    const store = this.getStore();
+    if (store !== undefined) {
+      store.putSync(KEY_SEARCH_HISTORY, '[]');
+      store.flush();
+    }
+    this.searchHistoryVersion++;
+  }
+
+  /** @returns The persisted search source selection; 'all' when every source is enabled. */
+  public getSearchSource(): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return 'all';
+    }
+    const id: string = store.getSync(KEY_SEARCH_SOURCE, 'all') as string;
+    return id.length > 0 ? id : 'all';
+  }
+
+  /** Persists the search source selection ('all' or a source id like 'kw'). */
+  public setSearchSource(sourceId: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_SEARCH_SOURCE, sourceId);
+    store.flush();
+  }
+
+  /** @returns The raw cached search result JSON for a key; '' when absent. */
+  public getSearchResultCache(key: string): string {
+    const store = this.getStore();
+    if (store === undefined) {
+      return '';
+    }
+    const text: string = store.getSync(KEY_SEARCH_CACHE, '{}') as string;
+    try {
+      const map: Record<string, Object> = JSON.parse(text) as Record<string, Object>;
+      if (map !== undefined && map[key] !== undefined) {
+        return map[key] as string;
+      }
+    } catch (_err) {
+      // corrupt cache: ignore
+    }
+    return '';
+  }
+
+  /** Caches raw search result JSON by key without a size limit. */
+  public setSearchResultCache(key: string, json: string): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    const text: string = store.getSync(KEY_SEARCH_CACHE, '{}') as string;
+    let map: Record<string, Object> = {};
+    try {
+      const parsed: Record<string, Object> = JSON.parse(text) as Record<string, Object>;
+      if (parsed !== undefined) {
+        map = parsed;
+      }
+    } catch (_err) {
+      // corrupt cache: reset
+    }
+    map[key] = json;
+    store.putSync(KEY_SEARCH_CACHE, JSON.stringify(map));
+    store.flush();
+  }
+
+  /** @returns The persisted active LX source id; empty when none. */
+  public getActiveSource(): string {
+    const ctx = getAppRuntime().context;
+    if (ctx === undefined) {
+      return '';
+    }
+    const path: string = ctx.filesDir + '/' + ACTIVE_SOURCE_FILE;
+    try {
+      if (!fs.accessSync(path)) {
+        return '';
+      }
+      const stat: fs.Stat = fs.statSync(path);
+      if (stat.size <= 0) {
+        return '';
+      }
+      const buf: ArrayBuffer = new ArrayBuffer(stat.size);
+      const file: fs.File = fs.openSync(path, fs.OpenMode.READ_ONLY);
+      fs.readSync(file.fd, buf, { offset: 0, length: stat.size });
+      fs.closeSync(file);
+      const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
+      return decoder.decodeToString(new Uint8Array(buf)).trim();
+    } catch (_err) {
+      return '';
+    }
+  }
+
+  /** Persists the active LX source id synchronously (empty clears it). */
+  public setActiveSource(sourceId: string): void {
+    const ctx = getAppRuntime().context;
+    if (ctx === undefined) {
+      return;
+    }
+    const path: string = ctx.filesDir + '/' + ACTIVE_SOURCE_FILE;
+    try {
+      const encoder: util.TextEncoder = new util.TextEncoder();
+      const data: Uint8Array = encoder.encodeInto(sourceId);
+      const file: fs.File = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(file.fd, data.buffer as ArrayBuffer);
+      fs.closeSync(file);
+    } catch (_err) {
+      // ignore
+    }
+  }
+
+  /** Maps a JSON object back into a PlayedSongRecord. */
+  private static recordFromJson(obj: Record<string, Object>): PlayedSongRecord {
+    const record = new PlayedSongRecord();
+    record.songId = obj.songId as string ?? '';
+    record.name = obj.name as string ?? '';
+    record.singer = obj.singer as string ?? '';
+    record.albumName = obj.albumName as string ?? '';
+    record.albumId = obj.albumId as string ?? '';
+    record.source = obj.source as string ?? '';
+    record.interval = obj.interval as string ?? '';
+    record.img = obj.img as string ?? '';
+    record.url = obj.url as string ?? '';
+    record.lyric = obj.lyric as string ?? '';
+    record.time = obj.time as number ?? 0;
+    // ⚠️ 这两个字段一度漏掉（写的时候存了、读的时候没取）：
+    //   quality 丢了 → 重启后「当前音质」回落到默认 128k；
+    //   playScript 丢了 → 卡片/日志里「哪个音源脚本放的」变空。
+    // 凡是往 PlayedSongRecord 里加字段，这里**必须**跟着加一行。
+    record.quality = obj.quality as string ?? '';
+    record.playScript = obj.playScript as string ?? '';
+    return record;
+  }
+
+  /** @returns All user playlists (newest first). */
+  public getPlaylists(): PlaylistDto[] {
+    // ★ 缓存：preferences 里存的是**整份歌单 JSON**，这里每次都要 JSON.parse 一遍并
+    //   逐条重建所有歌单的所有歌曲记录 —— 复杂度是「全部歌单 × 全部歌曲」，跟你要查的
+    //   那个歌单无关。而歌单详情页的 Hero 标题/封面、歌单列表页、批量操作条都会在
+    //   build 期间调用它，一帧里能调好几次：歌单一多、歌曲一多，页面就会卡住。
+    //   所有写路径都是 `persistPlaylists()` + `playlistVersion++`（共 8 处，已逐一核对），
+    //   所以用版本号做键就能保证不会读到脏数据。
+    if (this.playlistsCache !== undefined && this.playlistsCacheVersion === this.playlistVersion) {
+      // 返回副本：调用方习惯 `list.unshift(p)` 之后再 persist，不能让它改到缓存本身
+      return this.playlistsCache.slice();
+    }
+    const store = this.getStore();
+    if (store === undefined) {
+      return [];
+    }
+    const text: string = store.getSync(KEY_PLAYLISTS, '[]') as string;
+    try {
+      const arr: Object[] = JSON.parse(text) as Object[];
+      const list: PlaylistDto[] = [];
+      for (let i: number = 0; i < arr.length; i++) {
+        const o = arr[i] as Record<string, Object>;
+        const p = new PlaylistDto();
+        p.id = o.id as string ?? '';
+        p.name = o.name as string ?? '';
+        // ★★ 这一行是「自定义歌单封面不生效」的真正原因：
+        //    `persistPlaylists()` 一直把 cover 写进 preferences，但这里**从来没读回来** ——
+        //    于是任何一次重新解析（版本号一变就会重解析）之后 `p.cover` 都变成空串，
+        //    界面（列表 + 详情页大图）自然永远看不到自定义封面，重启也一样。
+        //    凡是往 PlaylistDto 里加字段，这里必须跟着加一行。
+        p.cover = o.cover as string ?? '';
+        p.createTime = o.createTime as number ?? 0;
+        const songs: Object[] = o.songs as Object[] ?? [];
+        p.songs = [];
+        for (let j: number = 0; j < songs.length; j++) {
+          p.songs.push(MusicStoreService.recordFromJson(songs[j] as Record<string, Object>));
+        }
+        list.push(p);
+      }
+      this.playlistsCache = list;
+      this.playlistsCacheVersion = this.playlistVersion;
+      return list.slice();
+    } catch (_err) {
+      this.playlistsCache = [];
+      this.playlistsCacheVersion = this.playlistVersion;
+      return [];
+    }
+  }
+
+  /** Persists the playlist list. */
+  private persistPlaylists(list: PlaylistDto[]): void {
+    const store = this.getStore();
+    if (store === undefined) {
+      return;
+    }
+    store.putSync(KEY_PLAYLISTS, JSON.stringify(list));
+    store.flush();
+  }
+
+  /** Reorders the saved playlists to the given id sequence and persists. */
+  public reorderPlaylists(orderedIds: string[]): void {
+    const current: PlaylistDto[] = this.getPlaylists();
+    const byId: Map<string, PlaylistDto> = new Map<string, PlaylistDto>();
+    for (let i = 0; i < current.length; i++) {
+      byId.set(current[i].id, current[i]);
+    }
+    const reordered: PlaylistDto[] = [];
+    for (let i = 0; i < orderedIds.length; i++) {
+      const p = byId.get(orderedIds[i]);
+      if (p !== undefined) {
+        reordered.push(p);
+        byId.delete(orderedIds[i]);
+      }
+    }
+    const remaining: PlaylistDto[] = [];
+    byId.forEach((p: PlaylistDto): void => {
+      remaining.push(p);
+    });
+    for (let i = 0; i < remaining.length; i++) {
+      reordered.push(remaining[i]);
+    }
+    this.persistPlaylists(reordered);
+    this.playlistVersion++;
+  }
+
+  /** @returns The playlist with the given id, or undefined. */
+  public getPlaylistById(id: string): PlaylistDto | undefined {
+    const list: PlaylistDto[] = this.getPlaylists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === id) {
+        return list[i];
+      }
+    }
+    return undefined;
+  }
+
+  /** Creates a playlist with the given name. */
+  public createPlaylist(name: string): PlaylistDto {
+    const p = new PlaylistDto();
+    p.id = String(Date.now());
+    p.name = name;
+    p.createTime = Date.now();
+    p.songs = [];
+    const list: PlaylistDto[] = this.getPlaylists();
+    list.unshift(p);
+    this.persistPlaylists(list);
+    this.playlistVersion++;
+    return p;
+  }
+
+  /** Renames a playlist by id. */
+  public renamePlaylist(id: string, name: string): void {
+    const list: PlaylistDto[] = this.getPlaylists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === id) {
+        list[i].name = name;
+        this.persistPlaylists(list);
+        this.playlistVersion++;
+        return;
+      }
+    }
+  }
+
+  /**
+   * 设置歌单封面。
+   *
+   * @param id 歌单 id。
+   * @param cover 封面地址：自定义封面是**沙箱文件 URI**（`file://...`，由
+   *              `features/playlist` 的 `pickPlaylistCover` 落盘后给出）；
+   *              传空串表示清掉自定义封面（在线导入的歌单清掉后就回到内置占位图）。
+   */
+  public setPlaylistCover(id: string, cover: string): void {
+    const list: PlaylistDto[] = this.getPlaylists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === id) {
+        list[i].cover = cover;
+        this.persistPlaylists(list);
+        this.playlistVersion++;
+        return;
+      }
+    }
+  }
+
+  /**
+   * 把某首在线歌的封面写回所有包含它的本地歌单（导入后无封面、播放后补全）。
+   * 仅在原 img 为空或与新地址不同时写入，避免无意义刷盘。
+   */
+  public updateSongCoverInPlaylists(source: string, songId: string, img: string): void {
+    if (source.length === 0 || songId.length === 0 || img.length === 0) {
+      return;
+    }
+    const list: PlaylistDto[] = this.getPlaylists();
+    let changed: boolean = false;
+    for (let i: number = 0; i < list.length; i++) {
+      const songs: PlayedSongRecord[] = list[i].songs;
+      for (let j: number = 0; j < songs.length; j++) {
+        if (songs[j].source === source && songs[j].songId === songId) {
+          if (songs[j].img !== img) {
+            songs[j].img = img;
+            changed = true;
+          }
+        }
+      }
+    }
+    if (changed) {
+      this.persistPlaylists(list);
+      this.playlistVersion++;
+    }
+  }
+
+  /** Deletes a playlist by id. */
+  public deletePlaylist(id: string): void {
+    const list: PlaylistDto[] = this.getPlaylists();
+    const kept: PlaylistDto[] = [];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== id) {
+        kept.push(list[i]);
+      }
+    }
+    this.persistPlaylists(kept);
+    this.playlistVersion++;
+  }
+
+  /** Adds a song to a playlist (dedupe by source+songId). @returns True when added. */
+  public addSongToPlaylist(playlistId: string, record: PlayedSongRecord): boolean {
+    const list: PlaylistDto[] = this.getPlaylists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === playlistId) {
+        const id: string = record.source + '_' + record.songId;
+        for (let j: number = 0; j < list[i].songs.length; j++) {
+          if (list[i].songs[j].source + '_' + list[i].songs[j].songId === id) {
+            return false;
+          }
+        }
+        if (this.getPlaylistAddPosition() === 'top') {
+          list[i].songs.unshift(record);
+        } else {
+          list[i].songs.push(record);
+        }
+        this.persistPlaylists(list);
+        this.playlistVersion++;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Removes a song from a playlist by source and songId. */
+  public removeSongFromPlaylist(playlistId: string, source: string, songId: string): void {
+    const list: PlaylistDto[] = this.getPlaylists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === playlistId) {
+        const id: string = source + '_' + songId;
+        const kept: PlayedSongRecord[] = [];
+        for (let j: number = 0; j < list[i].songs.length; j++) {
+          if (list[i].songs[j].source + '_' + list[i].songs[j].songId !== id) {
+            kept.push(list[i].songs[j]);
+          }
+        }
+        list[i].songs = kept;
+        this.persistPlaylists(list);
+        this.playlistVersion++;
+        return;
+      }
+    }
+  }
+
+  /** Reorders the songs inside a playlist to the given key sequence (source_songId). */
+  public reorderPlaylistSongs(playlistId: string, orderedKeys: string[]): void {
+    const list: PlaylistDto[] = this.getPlaylists();
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id === playlistId) {
+        const byKey: Map<string, PlayedSongRecord> = new Map<string, PlayedSongRecord>();
+        for (let j: number = 0; j < list[i].songs.length; j++) {
+          const s = list[i].songs[j];
+          byKey.set(s.source + '_' + s.songId, s);
+        }
+        const reordered: PlayedSongRecord[] = [];
+        for (let k: number = 0; k < orderedKeys.length; k++) {
+          const song = byKey.get(orderedKeys[k]);
+          if (song !== undefined) {
+            reordered.push(song);
+            byKey.delete(orderedKeys[k]);
+          }
+        }
+        byKey.forEach((song: PlayedSongRecord): void => {
+          reordered.push(song);
+        });
+        list[i].songs = reordered;
+        this.persistPlaylists(list);
+        this.playlistVersion++;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Dedupes a playlist by (title + singer): keeps the copy with the highest
+   * retention priority and removes duplicates lower in the priority chain
+   * (mg < kw < kg < wy < tx; tx / QQ is kept first).
+   * @param playlistId Playlist id to dedupe.
+   * @returns Number of songs removed.
+   */
+  public dedupePlaylistSongs(playlistId: string): number {
+    const list: PlaylistDto[] = this.getPlaylists();
+    const priorityOrder: string[] = ['mg', 'kw', 'kg', 'wy', 'tx', 'qs'];
+    for (let i: number = 0; i < list.length; i++) {
+      if (list[i].id !== playlistId) {
+        continue;
+      }
+      const songPriority: Map<string, number> = new Map<string, number>();
+      for (let p: number = 0; p < priorityOrder.length; p++) {
+        songPriority.set(priorityOrder[p], p);
+      }
+      const bestByKey: Map<string, number> = new Map<string, number>();
+      for (let j: number = 0; j < list[i].songs.length; j++) {
+        const s = list[i].songs[j];
+        const nameKey: string = (s.name ?? '').trim().toLowerCase();
+        const singerKey: string = (s.singer ?? '').trim().toLowerCase();
+        if (nameKey.length === 0) {
+          continue;
+        }
+        const key: string = nameKey + '|' + singerKey;
+        const idx = bestByKey.get(key);
+        if (idx === undefined) {
+          bestByKey.set(key, j);
+          continue;
+        }
+        const kept = list[i].songs[idx];
+        const curPrio: number = songPriority.get(s.source) ?? -1;
+        const keptPrio: number = songPriority.get(kept.source) ?? -1;
+        if (curPrio > keptPrio) {
+          bestByKey.set(key, j);
+        }
+      }
+      const deduped: PlayedSongRecord[] = [];
+      const chosen: Set<number> = new Set<number>();
+      bestByKey.forEach((songIndex: number): void => {
+        chosen.add(songIndex);
+      });
+      for (let j: number = 0; j < list[i].songs.length; j++) {
+        const s = list[i].songs[j];
+        const nameKey: string = (s.name ?? '').trim().toLowerCase();
+        const singerKey: string = (s.singer ?? '').trim().toLowerCase();
+        const key: string = (nameKey.length === 0 ? '' : nameKey + '|' + singerKey);
+        if (chosen.has(j) || key.length === 0) {
+          deduped.push(s);
+        }
+      }
+      const removed: number = list[i].songs.length - deduped.length;
+      list[i].songs = deduped;
+      this.persistPlaylists(list);
+      this.playlistVersion++;
+      return removed;
+    }
+    return 0;
+  }
+
+  /** Imports a playlist (used for LXMusic import and restore). */
+  public importPlaylist(name: string, songs: PlayedSongRecord[]): PlaylistDto {
+    const p = new PlaylistDto();
+    p.id = String(Date.now());
+    p.name = name;
+    p.createTime = Date.now();
+    p.songs = songs;
+    const list: PlaylistDto[] = this.getPlaylists();
+    list.unshift(p);
+    this.persistPlaylists(list);
+    this.playlistVersion++;
+    return p;
+  }
+
+  /** Maps a SongItem into a serializable record. */
+  public static fromSongItem(item: SongItem): PlayedSongRecord {
+    const record = new PlayedSongRecord();
+    record.songId = item.songId;
+    record.name = typeof item.title === 'string' ? item.title : '';
+    record.singer = typeof item.singer === 'string' ? item.singer : '';
+    record.albumName = item.albumName;
+    record.albumId = item.albumId;
+    record.source = item.source;
+    record.interval = item.interval;
+    record.img = item.cover;
+    record.url = item.url;
+    record.lyric = item.lyricText;
+    record.quality = item.quality;
+    record.playScript = item.playScript;
+    record.time = Date.now();
+    return record;
+  }
+
+  /** Rebuilds a SongItem from a stored record; url is pre-filled when available. */
+  public static toSongItem(record: PlayedSongRecord): SongItem {
+    const item = new SongItem();
+    item.id = record.time;
+    item.title = record.name;
+    item.singer = record.singer;
+    item.src = '';
+    item.url = record.url;
+    item.lyricText = record.lyric;
+    item.cover = record.img;
+    item.source = record.source;
+    item.songId = record.songId;
+    item.albumId = record.albumId;
+    item.albumName = record.albumName;
+    item.interval = record.interval;
+    item.quality = record.quality;
+    item.playScript = record.playScript;
+    return item;
+  }
+}

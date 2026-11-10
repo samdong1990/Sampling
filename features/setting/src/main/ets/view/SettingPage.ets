@@ -1,0 +1,2035 @@
+/*
+ * Copyright (c) 2026 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { guardPlayerBack } from 'musicbasic';
+import { AppStorageV2, CapsuleSegmentButtonV2, ColorMetrics, LengthMetrics, SegmentButtonV2Items, uiObserver } from '@kit.ArkUI';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { common, ConfigurationConstant, Want, wantConstant } from '@kit.AbilityKit';
+import { fileIo as fs, picker } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
+import { systemShare } from '@kit.ShareKit';
+import { uniformTypeDescriptor } from '@kit.ArkData';
+import { fileUri } from '@kit.CoreFileKit';
+import { http } from '@kit.NetworkKit';
+import { pasteboard } from '@kit.BasicServicesKit';
+import { appendPlayLog, CoverCacheSettingsCard, AmbientState, AppStorageKeys, BarScrollHelper, RouterUrlConstants, BreakpointType, HomeSourceState, LocalCoverImage, LyricBlurState, LyricFontSizeState, MusicAppState, MusicStoreService, notifyHomeSourceRefresh, PageTopInsetHelper, ShowMiniLyricState, ThemeState, TitleBarConstants, UseAccountRecState, WindowInfo, buildTitleMaterial, getStatusBarTopVpFromWindowUtil, getWindowInfoState } from 'musicbasic';
+import { BlurStrategy, HdsNavigation, HdsNavigationTitleMode, HdsNavDestination, HdsNavDestinationTitleMode, HdsNavigationTitleBarOptions, ScrollEffectType, TitleSize } from '@kit.UIDesignKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+import { NetworkImportSheet } from 'playlist';
+import { LXUserApiInfo, LXSourcePlatformInfo, lxDeclaredPlatformsOf, lxSourceManager, MediaService } from 'player';
+import type { LXApiImportResult } from 'player';
+import { HuaweiAccountService, HuaweiAccountState } from 'player';
+import { PlayerConstants } from 'player';
+import { AccountManageSheet } from '../account/AccountManageSheet';
+import { PlatformMusicPage } from '../account/PlatformMusicPage';
+
+import { CustomColorSheetContent } from './CustomColorSheetContent';
+import { SettingsDetailPage, SettingsDetailRouteParam } from './SettingsDetailPage';
+import { CapsuleSegmentedSelector } from './CapsuleSegmentedSelector';
+import { OptionChoiceSheet } from './OptionChoiceSheet';
+import { DownloadManagerSection } from './DownloadManagerSection';
+import { LxSourceDeclaredBlock } from './LxSourceTags';
+import { SourceManagerList } from './SourceManagerList';
+import { importSourceFiles } from '../util/SourceFileImport';
+import { checkAndApplySourceUpdate, SourceUpdateApplyResult } from '../util/SourceUpdate';
+const LX_ONLINE_IMPORT_MAX_BYTES: number = 9 * 1024 * 1024;
+const LX_ONLINE_IMPORT_TIMEOUT: number = 15000;
+const DEFAULT_SETTING_INDEX: number = 4;
+
+/** 日志域 / 标签：`grep RzdPageTopInset` 看页盒顶边实测与由此算出的让位。 */
+const DOMAIN: number = 0x0000;
+const TAG: string = 'RzdSettingPage';
+
+/** 设置页大卡片内的一行设置入口。 */
+class SettingsEntry {
+  icon: Resource = $r('app.media.ic_system');
+  title: Resource | string = '';
+  subtitle: string = '';
+  onClick: () => void = (): void => {};
+  id: number = -1;
+  /** 搜索用中文标签（配合顶部搜索框过滤设置项）。 */
+  searchText: string = '';
+}
+
+/**
+ * Settings tab: music source (LX user API) management with file import and
+ * online import by URL, plus playback quality selection.
+ */
+@ComponentV2
+export struct SettingPage {
+  /** 「回到顶部」指令：壳层点了当前页签时递增（底部页签设计规范）。 */
+  @Param scrollTopCommand: number = 0;
+  /** Window breakpoint for the HDS home-style responsive title. */
+  @Env(SystemProperties.BREAK_POINT) breakpointEnv: uiObserver.WindowSizeLayoutBreakpointInfo;
+  @Local lxApiList: LXUserApiInfo[] = [];
+  /** 参与依次换源的脚本 id 顺序（多选+可排序）。 */
+  @Local sourceOrderIds: string[] = [];
+  @Local activeSource: string = '';
+  @Local engineReady: boolean = false;
+  @Local engineSources: string = '{}';
+  @Local lastError: string = '';
+  @Local playLog: string = '';
+  /** 设置页统一底部弹窗开关（在线导入 / 自定义颜色 / 平台账号 / 平台音乐，避免同组件多 bindSheet 冲突） */
+  @Local showSettingSheet: boolean = false;
+  @Consumer('pageIndexInfos') pageStack: NavPathStack = new NavPathStack();
+  @Local settingStack: NavPathStack = new NavPathStack();
+  @Local selectedIndex: number = -1;
+  @Local windowInfo: WindowInfo = getWindowInfoState();
+  /** 当前弹窗类型：0=在线导入，1=自定义颜色，2=平台账号，3=平台音乐，4=播放，5=音源，6=下载，7=主题，8=其它，9=关于，10=下载管理。 */
+  @Local activeSettingSheet: number = -1;
+  /** 搜索关键词（顶部搜索栏过滤设置项）。 */
+  @Local searchKeyword: string = '';
+  /** sheet 关闭动画进行中标识，用于把 "关闭期间点开下一个" 排队到关闭完成后。 */
+  private sheetClosing: boolean = false;
+  /** 关闭动画期间排队等待打开的 sheet 类型，-1 表示无排队。 */
+  private pendingSheetIndex: number = -1;
+  @Local onlineUrl: string = '';
+  @Local importing: boolean = false;
+  @Local store: MusicStoreService = MusicStoreService.getInstance();
+  /** 仅保存静态选项；选中态由分网 store 唯一真源派生。 */
+  private readonly networkQualityModeItems: SegmentButtonV2Items = new SegmentButtonV2Items([
+    { text: '关' },
+    { text: '开' }
+  ]);
+  private readonly downloadQualityModeItems: SegmentButtonV2Items = new SegmentButtonV2Items([
+    { text: '关' },
+    { text: '开' }
+  ]);
+  private readonly qualityRowLabels: string[][] = [
+    ['128K', '320K', 'FLAC', '24Bit'],
+    ['Hi-Res', '全景声', '全景声+', '母带']
+  ];
+  private readonly qualityRowValues: string[][] = [
+    ['128k', '320k', 'flac', 'flac24bit'],
+    ['hires', 'atmos', 'atmos_plus', 'master']
+  ];
+  @Local ambientLevel: number = 0;
+  @Local themeState: ThemeState =
+    AppStorageV2.connect(ThemeState, AppStorageKeys.THEME_STATE, () => new ThemeState())!;
+  /** 华为账号登录态：「登录音乐」那张卡登录后要显示头像与昵称。 */
+  @Local huaweiState: HuaweiAccountState =
+    AppStorageV2.connect(HuaweiAccountState, PlayerConstants.HUAWEI_ACCOUNT_STATE,
+      () => new HuaweiAccountState())!;
+  @Local customColor: string = '';
+  @Local colorMode: number = 2;
+  private readonly presetColors: string[] = [
+    '#E60012', '#FF6B35', '#FFC107', '#31C27C',
+    '#4A90D9', '#7C4DFF', '#FF4081', '#00BCD4', '#607D8B'
+  ];
+  /** Scroller bound to the HDS title bar so the scroll effect (gradient blur) can fire. */
+  private pageScroller: Scroller = new Scroller();
+  /** 全局播控状态：滚动联动双层底栏需要写 miniBarExpanded / hdsBarLayoutMode。 */
+  @Local appState: MusicAppState =
+    AppStorageV2.connect(MusicAppState, AppStorageKeys.MUSIC_APP_STATE, () => new MusicAppState())!;
+
+  /** Applies a theme color (hex) and persists it. */
+  private applyThemeColor(color: string): void {
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
+      return;
+    }
+    this.themeState.color = color;
+    MusicStoreService.getInstance().setThemeColor(color);
+  }
+  private readonly ambientOptions: string[] = ['跟随系统', '弱', '均衡', '强'];
+  /** Download file name format options (labels), values: title/artist_title/title_artist. */
+  private readonly nameFormatOptions: string[] = ['歌曲名', '艺术家-标题', '标题-艺术家'];
+  private readonly nameFormatValues: string[] = ['title', 'artist_title', 'title_artist'];
+  /** Add-to-playlist position options (labels), values: top/bottom. */
+  private readonly addPositionOptions: string[] = ['顶部', '底部'];
+  private readonly addPositionValues: string[] = ['top', 'bottom'];
+  private readonly homeSourceOptions: string[] = ['QQ', '酷狗', '网易'];
+  private readonly homeSourceValues: string[] = ['qq', 'kg', 'wy'];
+  /** On/off toggle options for segment-button style switches. */
+  private readonly onOffOptions: string[] = ['开', '关'];
+  /** Save location options for the download save-mode selector. */
+  private readonly saveLocationOptions: string[] = ['手动选择', 'Download目录'];
+  /** Day/night/system color-mode options. */
+  private readonly colorModeOptions: string[] = ['日间', '夜间', '跟随系统'];
+  /** Whether downloads save to the app Download dir instead of asking for a folder. */
+  @Local saveToDownloadDir: boolean = false;
+  /** Selected download file name format key. */
+  @Local downloadNameFormat: string = 'title';
+  /** Selected add-to-playlist position key. */
+  @Local playlistAddPosition: string = 'bottom';
+  /** Whether the playback page shows mini lyric lines below the cover. */
+  @Local showMiniLyric: boolean = false;
+  /** Whether playback shares audio focus with other apps. */
+  @Local audioMix: boolean = false;
+  /** 启动应用自动开始播放（默认关）。 */
+  @Local autoPlayOnLaunch: boolean = false;
+  @Local crossScriptFallback: boolean = true;
+  /** Whether the lyrics page applies blur to non-active lines. */
+  @Local lyricBlurEnabled: boolean = true;
+  /** 歌词页当前行高亮字号（滑块可调，持久化）。 */
+  @Local lyricFontSize: number = 28;
+  /** Whether the lyrics/playback page keeps the screen on. */
+  @Local keepScreenOn: boolean = false;
+  /** Whether downloaded file names include the quality tag. */
+  @Local downloadQualityTag: boolean = false;
+  /** Home recommendation source ('qq'|'kg'|'wy'|'mg'). */
+  @Local homeSource: string = 'qq';
+  /** Whether the home recommendation uses the logged-in QQ account's daily picks. */
+  @Local useAccountRec: boolean = false;
+
+  aboutToAppear(): void {
+    this.refresh();
+    this.syncWideSettingLayout();
+    // 恢复华为账号登录态：登录过之后「登录音乐」那张卡要显示头像与昵称
+    HuaweiAccountService.getInstance().restore();
+  }
+
+  private isWideSettingLayout(): boolean {
+    return this.breakpointEnv.widthBreakpoint === WidthBreakpoint.WIDTH_MD ||
+      this.breakpointEnv.widthBreakpoint === WidthBreakpoint.WIDTH_LG ||
+      this.breakpointEnv.widthBreakpoint === WidthBreakpoint.WIDTH_XL;
+  }
+
+  private navBarWidthValue(): string {
+    if (!this.isWideSettingLayout()) {
+      return '100%';
+    }
+    return this.breakpointEnv.widthBreakpoint === WidthBreakpoint.WIDTH_MD ? '50%' : '36%';
+  }
+
+  private syncWideSettingLayout(): void {
+    if (this.isWideSettingLayout() && this.settingStack.size() === 0) {
+      this.settingStack.disableAnimation(true);
+      this.openSettingSheet(DEFAULT_SETTING_INDEX);
+    }
+  }
+
+  /** 壳层点了当前页签：滚回顶部（底部页签设计规范）。 */
+  @Monitor('scrollTopCommand')
+  onScrollTopCommand(): void {
+    this.pageScroller.scrollEdge(Edge.Top);
+  }
+
+  @Monitor('windowInfo.widthBp')
+  onWindowWidthBpChanged(): void {
+    this.syncWideSettingLayout();
+  }
+
+  private refresh(): void {
+    this.lxApiList = lxSourceManager.getApiList();
+    this.sourceOrderIds = MusicStoreService.getInstance().getSourceScriptOrder();
+    // 未配置过顺序时，默认全部勾选并按导入顺序
+    if (this.sourceOrderIds.length === 0) {
+      const ids: string[] = [];
+      for (let i: number = 0; i < this.lxApiList.length; i++) {
+        if (this.lxApiList[i].id.length > 0) {
+          ids.push(this.lxApiList[i].id);
+        }
+      }
+      this.sourceOrderIds = ids;
+      // ★★★ 2026-11-05（真机日志实证 `[回退链] 没有勾选任何音源，直接返回`）：
+      //   只把"全部已导入"填进 UI 变量、**不落盘** ⇒ `getSourceScriptOrder()` 恒为空
+      //   ⇒ 播放链路拿到空候选链 ⇒ 0 次请求秒失败（而用户看到的是"全都勾着"）。
+      //   首次进来就把这份默认全选写实，UI 与播放链路一致。
+      if (ids.length > 0) {
+        MusicStoreService.getInstance().setSourceScriptOrder(ids);
+        appendPlayLog('[音源顺序] init ' + ids.length);
+      }
+    }
+    this.activeSource = AppStorage.get<string>('lxActiveSource') ?? '';
+    if (this.activeSource.length === 0) {
+      this.engineReady = false;
+    } else {
+      this.engineReady = AppStorage.get<boolean>('lxEngineReady') === true;
+    }
+    this.engineSources = AppStorage.get<string>('lxEngineSources') ?? '{}';
+    this.ambientLevel = MusicStoreService.getInstance().getAmbientLevel();
+    this.showMiniLyric = MusicStoreService.getInstance().getShowMiniLyric();
+    this.crossScriptFallback = MusicStoreService.getInstance().getCrossScriptFallback();
+    this.audioMix = MusicStoreService.getInstance().getAudioMix();
+    this.autoPlayOnLaunch = MusicStoreService.getInstance().getAutoPlayOnLaunch();
+    this.lyricBlurEnabled = MusicStoreService.getInstance().getLyricBlurEnabled();
+    this.saveToDownloadDir = MusicStoreService.getInstance().getDownloadSaveMode() === 'download';
+    this.downloadNameFormat = MusicStoreService.getInstance().getDownloadNameFormat();
+    this.playlistAddPosition = MusicStoreService.getInstance().getPlaylistAddPosition();
+    this.keepScreenOn = MusicStoreService.getInstance().getKeepScreenOn();
+    this.downloadQualityTag = MusicStoreService.getInstance().getDownloadQualityTag();
+    this.homeSource = MusicStoreService.getInstance().getHomeSource();
+    this.useAccountRec = MusicStoreService.getInstance().getUseAccountRec();
+    this.lyricFontSize = MusicStoreService.getInstance().getLyricFontSize();
+    this.lastError = AppStorage.get<string>('lxLastError') ?? '';
+    const persistentLog: string = MusicStoreService.getInstance().getRuntimeDiagnostics();
+    this.playLog = (AppStorage.get<string>('lxPlayLog') ?? '') +
+      (persistentLog.length > 0 ? '\n──── 持久诊断（重启保留）────\n' + persistentLog : '');
+    this.colorMode = MusicStoreService.getInstance().getColorMode();
+  }
+
+  private copyPlayLog(): void {
+    const log: string = this.playLog.length > 0 ? this.playLog : this.lastError;
+    if (log.length === 0) {
+      this.toast('暂无日志');
+      return;
+    }
+    const pasteData: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, log);
+    const sysPasteboard: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+    sysPasteboard.setData(pasteData);
+    this.toast('日志已复制');
+  }
+
+  private openSettingSheet(index: number): void {
+    this.selectedIndex = index;
+    if (this.isWideSettingLayout()) {
+      return;
+    }
+    const param = new SettingsDetailRouteParam();
+    param.index = index;
+    this.pageStack.pushPathByName(RouterUrlConstants.SETTINGS_DETAIL, param);
+    this.selectedIndex = -1;
+  }
+
+  /** 关闭设置弹窗；标记动画进行中，防止立刻重开被吞。 */
+  private closeSettingSheet(): void {
+    this.sheetClosing = true;
+    this.showSettingSheet = false;
+  }
+
+  /** bindSheet onWillDismiss：点击遮罩/下滑关闭时同步状态并放行关闭。 */
+  private onSheetWillDismiss(action: DismissSheetAction): void {
+    if (this.showSettingSheet) {
+      this.sheetClosing = true;
+      this.showSettingSheet = false;
+    }
+    action.dismiss();
+  }
+
+  /** bindSheet onDisappear：关闭动画完全结束后，把排队中的下一个弹窗打开。 */
+  private onSheetDisappear(): void {
+    this.sheetClosing = false;
+    if (this.pendingSheetIndex >= 0) {
+      const next: number = this.pendingSheetIndex;
+      this.pendingSheetIndex = -1;
+      this.activeSettingSheet = next;
+      this.showSettingSheet = true;
+    }
+  }
+
+  private activeSourceLabel(): string {
+    if (this.activeSource.length === 0) {
+      return '未选择';
+    }
+    for (let i = 0; i < this.lxApiList.length; i++) {
+      if (this.lxApiList[i].id === this.activeSource) {
+        return this.lxApiList[i].name;
+      }
+    }
+    return this.activeSource;
+  }
+
+  private nameFormatLabel(): string {
+    const idx = this.nameFormatValues.indexOf(this.downloadNameFormat);
+    return idx >= 0 ? this.nameFormatOptions[idx] : this.downloadNameFormat;
+  }
+
+  /**
+   * 一条音源脚本声明了哪些平台 / 什么音质 / 能做什么。
+   *
+   * 与 `SettingsDetailPage.lxPlatformsOf` 同源同一份实现（`player` 的
+   * `lxDeclaredPlatformsOf`）：脚本 init 上报 `sources` → `saveApiSources()` 落盘 →
+   * 这里读出来收敛成标签。没声明过就是空数组 ⇒ 界面给中性提示，**不猜**。
+   */
+  private lxPlatformsOf(api: LXUserApiInfo): LXSourcePlatformInfo[] {
+    return lxDeclaredPlatformsOf(api);
+  }
+
+  private colorModeLabel(): string {
+    if (this.colorMode === 0) return '日间';
+    if (this.colorMode === 1) return '夜间';
+    return '跟随系统';
+  }
+
+  private homeSourceLabel(): string {
+    const idx = this.homeSourceValues.indexOf(this.homeSource);
+    return idx >= 0 ? this.homeSourceOptions[idx] : this.homeSource;
+  }
+
+  private toast(message: string): void {
+    this.getUIContext().getPromptAction().showToast({ message: message, duration: 2000 });
+  }
+
+  /** Opens the donation page in the system browser. */
+  private openDonate(): void {
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (ctx === undefined) {
+      return;
+    }
+    try {
+      const want: Want = {
+        action: 'ohos.want.action.viewData',
+        entities: ['entity.system.browsable'],
+        uri: 'https://donate.rzdpai.com'
+      };
+      ctx.startAbility(want);
+    } catch (_err) {
+      this.toast('无法打开捐赠页面');
+    }
+  }
+
+  /** 用系统浏览器打开外部链接（更新页/主页这类非脚本链接走这里，避免把网页当脚本导入）。 */
+  private openInBrowser(url: string, label: string): void {
+    if (url.length === 0 || !/^https?:\/\//.test(url)) {
+      this.toast('链接无效');
+      return;
+    }
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const want: Want = {
+        action: 'ohos.want.action.viewData',
+        entities: ['entity.system.browsable'],
+        uri: url
+      };
+      ctx.startAbility(want);
+      appendPlayLog('[RzdUpdate] open browser url=' + url.substring(0, 80));
+    } catch (err) {
+      this.toast('无法打开浏览器：' + ((err as Error).message ?? ''));
+    }
+  }
+
+  /** Copies the QQ group number to the system clipboard. */
+  private copyQqGroup(): void {
+    const groupNumber: string = '1050543607';
+    const pasteData: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, groupNumber);
+    const sysPasteboard: pasteboard.SystemPasteboard = pasteboard.getSystemPasteboard();
+    sysPasteboard.setData(pasteData);
+    this.toast('已复制群号 ' + groupNumber);
+  }
+
+  private engineTimer: number = 0;
+
+  /** Polls the LX engine ready state until it becomes ready (or the page leaves). */
+  private startEnginePolling(): void {
+    this.stopEnginePolling();
+    this.engineTimer = setInterval(() => {
+      this.refresh();
+      if (this.activeSource.length === 0 || AppStorage.get<boolean>('lxEngineReady') === true) {
+        this.stopEnginePolling();
+      }
+    }, 1000);
+  }
+
+  private stopEnginePolling(): void {
+    if (this.engineTimer > 0) {
+      clearInterval(this.engineTimer);
+      this.engineTimer = 0;
+    }
+  }
+
+  aboutToDisappear(): void {
+    this.stopEnginePolling();
+  }
+
+  private selectLXSource(apiId: string): void {
+    const next: string = this.activeSource === apiId ? '' : apiId;
+    AppStorage.setOrCreate('lxActiveSource', next);
+    MusicStoreService.getInstance().setActiveSource(next);
+    this.activeSource = next;
+    this.engineReady = false;
+    this.startEnginePolling();
+  }
+
+  /** 检查更新：自动下载新版本并原地覆盖（不再只弹 toast / 跳浏览器）。 */
+  private async checkSourceUpdate(api: LXUserApiInfo): Promise<void> {
+    this.toast('检查更新中…');
+    const result: SourceUpdateApplyResult = await checkAndApplySourceUpdate(api);
+    if (result.applied) {
+      this.refresh();
+      this.toast(result.message);
+      return;
+    }
+    if (result.openUrl.length > 0) {
+      this.toast(result.message);
+      this.openInBrowser(result.openUrl, '音源更新');
+      return;
+    }
+    this.toast(result.message);
+    console.info('[RzdSourceUpdate] ' + api.name + ' no update: ' + result.message);
+  }
+
+  private deleteLXSource(apiId: string): void {
+    if (this.activeSource === apiId) {
+      AppStorage.setOrCreate('lxActiveSource', '');
+      MusicStoreService.getInstance().setActiveSource('');
+      this.activeSource = '';
+    }
+    // 同步从依次调用列表移除
+    if (this.sourceOrderIds.indexOf(apiId) >= 0) {
+      this.toggleSourceInOrder(apiId);
+    }
+    lxSourceManager.removeApi(apiId);
+    this.refresh();
+  }
+
+  /** Imports source scripts from multiple local files, retaining per-file failures. */
+  private async importLXSource(): Promise<void> {
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) {
+      return;
+    }
+    try {
+      const message: string = await importSourceFiles(context);
+      this.refresh();
+      if (message.length > 0) {
+        this.toast(message);
+      }
+    } catch (_error) {
+      this.toast('选择音源文件失败或已取消');
+    }
+  }
+
+  /** Imports a source script fetched from a URL (online import). */
+  private async importOnline(): Promise<void> {
+    const url: string = this.onlineUrl.trim();
+    if (url.length === 0 || !/^https?:\/\//.test(url)) {
+      this.toast('请输入以 http:// 或 https:// 开头的链接');
+      return;
+    }
+    this.importing = true;
+    const httpRequest = http.createHttp();
+    try {
+      const resp: http.HttpResponse = await httpRequest.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: LX_ONLINE_IMPORT_TIMEOUT,
+        readTimeout: LX_ONLINE_IMPORT_TIMEOUT,
+        expectDataType: http.HttpDataType.STRING
+      });
+      if (resp.responseCode !== 200 || typeof resp.result !== 'string') {
+        this.toast('拉取失败，请检查链接');
+        return;
+      }
+      const script: string = resp.result as string;
+      if (script.length > LX_ONLINE_IMPORT_MAX_BYTES) {
+        this.toast('脚本过大（超过 9MB）');
+        return;
+      }
+      try {
+        const imported: LXApiImportResult = lxSourceManager.importApi(script);
+        if (!imported.ok) {
+          this.toast('导入失败：' + imported.message);
+          return;
+        }
+        this.refresh();
+        this.closeSettingSheet();
+        this.onlineUrl = '';
+        this.toast('已导入「' + imported.message + '」');
+      } catch (_parseErr) {
+        this.toast('导入失败: 无效的脚本文件');
+      }
+    } catch (_err) {
+      this.toast('拉取失败，请检查网络');
+    } finally {
+      httpRequest.destroy();
+      this.importing = false;
+    }
+  }
+
+  private selectColorMode(mode: number): void {
+    this.colorMode = mode;
+    MusicStoreService.getInstance().setColorMode(mode);
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (ctx === undefined) {
+      return;
+    }
+    if (mode === 0) {
+      ctx.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT);
+    } else if (mode === 1) {
+      ctx.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_DARK);
+    } else {
+      ctx.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+    }
+  }
+
+  private selectSaveLocation(download: boolean): void {
+    this.saveToDownloadDir = download;
+    // ★ 2026-10-20：开关关掉 = 存**应用私有目录**（默认，下载完直接出现在本地音乐里），sk 不再用
+      MusicStoreService.getInstance().setDownloadSaveMode(download ? 'download' : 'ask');
+  }
+
+  @Builder
+  /**
+   * 在线导入（音源）：★ 2026-10-31（用户：和「在线导入歌单」用同一个半模态）——
+   * 直接复用歌单那边的共用组件 `NetworkImportSheet`，不再自己写一个只有 URL 输入框的简易表单。
+   * 平板上也走同一个组件（它自带 `bindSheet` 宿主，分栏形态下同样可用）。
+   */
+  @Builder
+  private OnlineImportSheet() {
+    NetworkImportSheet({
+      onClose: (): void => {
+        this.closeSettingSheet();
+      },
+      onImported: (_name: string, _count: number): void => {
+        this.closeSettingSheet();
+      }
+    })
+  }
+
+
+  /** 平台账号管理弹窗：账号管理。 */
+  @Builder
+  private AccountSheetBuilder() {
+    Column() {
+      AccountManageSheet({
+        onClose: (): void => {
+          this.closeSettingSheet();
+        }
+      })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 平台音乐弹窗。 */
+  @Builder
+  private PlatformMusicSheetBuilder() {
+    Column() {
+      PlatformMusicPage({
+        onClose: (): void => {
+          this.closeSettingSheet();
+        }
+      })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** Cached title bar options so scrolling rebuilds do not recreate material params. */
+  private cachedTitleBarOptions: HdsNavigationTitleBarOptions | undefined = undefined;
+
+  /**
+   * 页根（`HdsNavDestination`）在**窗口坐标**里的顶边 y（vp），由 `onAreaChange` 实测。
+   *
+   * 默认 0 = "页盒贴屏幕顶"（= 参考工程 lxmusic-harmony 的假设，也是我们此前写死的那套），
+   * 量到非 0（框架把页盒压在安全区内）后：内容让位与 HDS 标题栏的 `avoidLayoutSafeArea`
+   * 一起换算过来，标题与内容都不会再整体下移一个状态栏。见 `PageTopInsetHelper` 的说明。
+   */
+  @Local boxTopVp: number = 0;
+
+  /** 盒顶量出来（或变化）后丢弃标题栏缓存，让 `avoidLayoutSafeArea` 跟着改。 */
+  @Monitor('boxTopVp')
+  onBoxTopChanged(): void {
+    this.cachedTitleBarOptions = undefined;
+  }
+
+  /** 光感等级变化时丢弃标题栏缓存，使设置页自身标题栏的沉浸材质实时跟随设置变化。 */
+  @Monitor('ambientLevel')
+  onAmbientLevelChanged(): void {
+    this.cachedTitleBarOptions = undefined;
+  }
+
+  /** HDS title bar with system material and gradient blur. */
+  private getTitleBar(): HdsNavigationTitleBarOptions {
+    if (this.cachedTitleBarOptions !== undefined) {
+      return this.cachedTitleBarOptions;
+    }
+    this.cachedTitleBarOptions = {
+      // ★ 页盒实测贴屏幕顶（盒顶 = 0）时，才让 HDS 标题栏自己退回状态栏下方；
+      //   盒顶本身已在状态栏下沿（38）时不能再退，否则标题栏会掉到 38 + 38（用户报的「标题下移」）。
+      avoidLayoutSafeArea: PageTopInsetHelper.avoidLayoutSafeArea(this.boxTopVp),
+      style: {
+        blurStrategy: BlurStrategy.ENABLE,
+        scrollEffectOpts: {
+          scrollEffectType: ScrollEffectType.IMMERSIVE_GRADIENT_BLUR
+        },
+        originalStyle: {
+          contentStyle: {
+            titleStyle: {
+              mainTitleColor: $r('app.color.font_primary')
+            },
+            backIconStyle: {
+              iconColor: $r('app.color.font_primary'),
+              backgroundColor: '#1A808080'
+            }
+          }
+        },
+        scrollEffectStyle: {
+          contentStyle: {
+            titleStyle: {
+              mainTitleColor: $r('app.color.font_primary')
+            },
+            backIconStyle: {
+              iconColor: $r('app.color.font_primary'),
+              backgroundColor: '#1A808080'
+            }
+          }
+        },
+        systemMaterialEffect: buildTitleMaterial(this.ambientLevel)
+      },
+      content: {
+        title: {
+          mainTitle: $r('app.string.setting_title'),
+          mainTitleSize: TitleSize.TITLE_ML
+        }
+      }
+    };
+    return this.cachedTitleBarOptions;
+  }
+
+  @Builder
+  private CardTitle(title: Resource | string) {
+    Text(title)
+      .fontSize($r('sys.float.Subtitle_L'))
+      .fontWeight(FontWeight.Bold)
+      .fontColor($r('sys.color.font_primary'))
+      .width('100%')
+      .margin({ bottom: 4 })
+  }
+
+  @Builder
+  private SubTitle(title: Resource | string) {
+    Text(title)
+      .fontSize($r('sys.float.Body_S'))
+      .fontColor($r('sys.color.font_tertiary'))
+      .width('100%')
+      .margin({ top: 8, bottom: 4 })
+  }
+
+  @Builder
+  private CapsuleSelector(labels: string[], selectedIndex: number, onSelect: (index: number) => void) {
+    CapsuleSegmentedSelector({
+      labels: labels,
+      selectedIndex: selectedIndex,
+      accentColor: this.themeState.color,
+      onSelect: onSelect
+    })
+  }
+
+  @Builder
+  private ColorDotRow() {
+    Scroll() {
+      Row({ space: 12 }) {
+        Stack() {
+          if (this.customColor.length > 0 && /^#[0-9a-fA-F]{6}$/.test(this.customColor) &&
+            this.themeState.color.toLowerCase() === this.customColor.toLowerCase()) {
+            Row() {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(12)
+                .fontColor([$r('sys.color.font_on_primary')])
+            }
+            .width(32)
+            .height(32)
+            .borderRadius(16)
+            .backgroundColor(this.customColor)
+            .justifyContent(FlexAlign.Center)
+            .border({ width: 2, color: $r('sys.color.font_primary') })
+          } else {
+            Row() {
+              SymbolGlyph($r('sys.symbol.plus'))
+                .fontSize(14)
+                .fontColor([$r('sys.color.font_primary')])
+            }
+            .width(32)
+            .height(32)
+            .borderRadius(16)
+            .backgroundColor($r('app.color.card_background'))
+            .justifyContent(FlexAlign.Center)
+            .border({ width: 2, color: $r('sys.color.font_tertiary') })
+          }
+        }
+        .width(32)
+        .height(32)
+        .onClick(() => {
+          this.openSettingSheet(1);
+        })
+
+        ForEach(this.presetColors, (color: string) => {
+          Row() {
+            if (this.themeState.color.toLowerCase() === color.toLowerCase()) {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(14)
+                .fontColor([$r('sys.color.font_on_primary')])
+            }
+          }
+          .width(32)
+          .height(32)
+          .borderRadius(16)
+          .backgroundColor(color)
+          .justifyContent(FlexAlign.Center)
+          .border({ width: 2, color: this.themeState.color.toLowerCase() === color.toLowerCase() ?
+            $r('sys.color.font_primary') : Color.Transparent })
+          .onClick(() => {
+            this.applyThemeColor(color);
+          })
+        }, (color: string) => color)
+      }
+      .height(40)
+      .padding({ left: 2, right: 2 })
+    }
+    .scrollable(ScrollDirection.Horizontal)
+    .scrollBar(BarState.Off)
+    .width('100%')
+    .margin({ top: 8 })
+    .nestedScroll({
+      scrollForward: NestedScrollMode.SELF_FIRST,
+      scrollBackward: NestedScrollMode.SELF_FIRST
+    })
+  }
+
+  @Builder
+  private CustomColorSheet() {
+    CustomColorSheetContent({
+      customColor: this.customColor,
+      accentColor: this.themeState.color,
+      presetColors: this.presetColors,
+      onColorSelected: (color: string): void => { this.customColor = color; },
+      onTextChange: (value: string): void => { this.customColor = value; },
+      onApply: (): void => { this.applyCustomColor(); },
+      onCancel: (): void => { this.closeSettingSheet(); }
+    })
+  }
+
+  /** 统一底部弹窗：按 activeSettingSheet 渲染对应分组内容。 */
+  @Builder
+  private SettingSheetBuilder() {
+    if (this.activeSettingSheet === 0) {
+      this.OnlineImportSheet()
+    } else if (this.activeSettingSheet === 1) {
+      this.CustomColorSheet()
+    } else if (this.activeSettingSheet === 2) {
+      this.AccountSheetBuilder()
+    } else if (this.activeSettingSheet === 3) {
+      this.PlatformMusicSheetBuilder()
+    } else if (this.activeSettingSheet === 4) {
+      this.PlaybackSheet()
+    } else if (this.activeSettingSheet === 5) {
+      this.SourceManagerSheet()
+    } else if (this.activeSettingSheet === 6) {
+      this.DownloadSheet()
+    } else if (this.activeSettingSheet === 7) {
+      this.ThemeSheet()
+    } else if (this.activeSettingSheet === 8) {
+      this.OtherSheet()
+    } else if (this.activeSettingSheet === 9) {
+      this.AboutSheet()
+    } else if (this.activeSettingSheet === 10) {
+      this.DownloadManagerSheet()
+    }
+  }
+
+  /** 下载管理弹窗：任务队列与进度。 */
+  @Builder
+  private DownloadManagerSheet() {
+    Column() {
+      // ★ 把本页的 scroller 传下去：否则子组件自己 new 一个 ⇒ 标题栏收不到滚动量 ⇒ 不模糊
+      //   （与「平台音乐」「我的 → 下载管理」同一条，见记忆 §29）。
+      DownloadManagerSection({ pageScroller: this.pageScroller })
+    }
+    .width('100%')
+    .height('100%')
+  }
+
+  /** 显式读取版本号，让共享 store 的异步恢复和其它入口修改驱动刷新。 */
+  private networkBaseQuality(wifi: boolean): string {
+    const version: number = this.store.networkQualityVersion;
+    return this.store.getNetworkBaseQuality(wifi);
+  }
+
+  private networkExtendedQuality(wifi: boolean): string {
+    const version: number = this.store.networkQualityVersion;
+    return this.store.getNetworkExtendedQuality(wifi);
+  }
+
+  private networkExtendedEnabled(wifi: boolean): boolean {
+    const version: number = this.store.networkQualityVersion;
+    return this.store.getNetworkExtendedEnabled(wifi);
+  }
+
+  private networkEffectiveQualityLabel(wifi: boolean): string {
+    const version: number = this.store.networkQualityVersion;
+    const quality: string = this.store.getNetworkPlayQuality(wifi);
+    for (let row: number = 0; row < this.qualityRowValues.length; row++) {
+      const index: number = this.qualityRowValues[row].indexOf(quality);
+      if (index >= 0) {
+        return this.qualityRowLabels[row][index];
+      }
+    }
+    return quality;
+  }
+
+  private logNetworkQuality(wifi: boolean, action: string): void {
+    console.info(`[RzdQualitySettings] network=${wifi ? 'wifi-ethernet' : 'cellular'} action=${action} ` +
+      `enabled=${this.store.getNetworkExtendedEnabled(wifi)} base=${this.store.getNetworkBaseQuality(wifi)} ` +
+      `extended=${this.store.getNetworkExtendedQuality(wifi)} effective=${this.store.getNetworkPlayQuality(wifi)}`);
+  }
+
+  @Builder
+  private NetworkQualitySettings(wifi: boolean, title: string) {
+    this.SubTitle(title)
+    this.SubTitle('基础音质')
+    this.CapsuleSelector(this.qualityRowLabels[0],
+      this.qualityRowValues[0].indexOf(this.networkBaseQuality(wifi)), (index: number) => {
+        this.store.setNetworkBaseQuality(wifi, this.qualityRowValues[0][index]);
+        this.logNetworkQuality(wifi, 'base');
+      })
+    this.SubTitle('拓展音质')
+    Column() {
+      CapsuleSegmentButtonV2({
+        items: this.networkQualityModeItems,
+        selectedIndex: this.networkExtendedEnabled(wifi) ? 1 : 0,
+        $selectedIndex: (index: number): void => {
+          this.store.setNetworkExtendedEnabled(wifi, index === 1);
+          this.logNetworkQuality(wifi, 'segment-mode');
+        },
+        buttonBackgroundColor: ColorMetrics.resourceColor($r('app.color.capsule_background')),
+        buttonMinHeight: LengthMetrics.vp(40),
+        buttonBorderRadius: LengthMetrics.vp(20),
+        itemMinHeight: LengthMetrics.vp(40),
+        itemBorderRadius: LengthMetrics.vp(20),
+        itemFontColor: ColorMetrics.resourceColor($r('sys.color.font_primary')),
+        itemSelectedFontColor: ColorMetrics.resourceColor($r('sys.color.font_on_primary')),
+        itemSelectedBackgroundColor: ColorMetrics.resourceColor(this.themeState.color)
+      })
+    }
+    .width('100%')
+    .padding({ top: 4, bottom: 4 })
+    if (this.networkExtendedEnabled(wifi)) {
+      this.CapsuleSelector(this.qualityRowLabels[1],
+        this.qualityRowValues[1].indexOf(this.networkExtendedQuality(wifi)), (index: number) => {
+          this.store.setNetworkExtendedQuality(wifi, this.qualityRowValues[1][index]);
+          this.logNetworkQuality(wifi, 'extended');
+        })
+    }
+    Text('当前生效音质：' + this.networkEffectiveQualityLabel(wifi))
+      .fontSize($r('sys.float.Caption_M'))
+      .fontColor(this.themeState.color)
+      .width('100%')
+      .padding({ top: 8, bottom: 8 })
+  }
+
+  /** 播放设置弹窗：音质+混音 / 其余，拆为两张卡片。 */
+  @Builder
+  private PlaybackSheet() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Column() {
+          this.NetworkQualitySettings(true, 'Wi-Fi / 以太网默认播放/下载音质')
+          this.NetworkQualitySettings(false, '蜂窝默认播放/下载音质')
+
+          this.SubTitle($r('app.string.setting_sub_audio_mix'))
+          this.CapsuleSelector(this.onOffOptions, this.audioMix ? 0 : 1,
+            (index: number) => {
+              const isOn: boolean = index === 0;
+              this.audioMix = isOn;
+              MusicStoreService.getInstance().setAudioMix(isOn);
+              MediaService.getInstance().applyAudioSession(isOn);
+            })
+
+          this.SubTitle('启动应用自动开始播放')
+          this.CapsuleSelector(this.onOffOptions, this.autoPlayOnLaunch ? 0 : 1,
+            (index: number) => {
+              const autoPlay: boolean = index === 0;
+              this.autoPlayOnLaunch = autoPlay;
+              MusicStoreService.getInstance().setAutoPlayOnLaunch(autoPlay);
+            })
+
+          this.SubTitle('播放失败自动跨音源脚本')
+          this.CapsuleSelector(this.onOffOptions, this.crossScriptFallback ? 0 : 1,
+            (index: number) => {
+              const isOn: boolean = index === 0;
+              this.crossScriptFallback = isOn;
+              MusicStoreService.getInstance().setCrossScriptFallback(isOn);
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+
+        Column() {
+          this.SubTitle($r('app.string.setting_sub_mini_lyric'))
+          this.CapsuleSelector(this.onOffOptions, this.showMiniLyric ? 0 : 1,
+            (index: number) => {
+              const isOn: boolean = index === 0;
+              this.showMiniLyric = isOn;
+              MusicStoreService.getInstance().setShowMiniLyric(isOn);
+              const state = AppStorageV2.connect(ShowMiniLyricState, AppStorageKeys.SHOW_MINI_LYRIC_STATE,
+                () => new ShowMiniLyricState());
+              if (state !== undefined) {
+                state.enabled = isOn;
+              }
+            })
+
+          this.SubTitle($r('app.string.setting_sub_lyric_blur'))
+          this.CapsuleSelector(this.onOffOptions, this.lyricBlurEnabled ? 0 : 1,
+            (index: number) => {
+              const isOn: boolean = index === 0;
+              this.lyricBlurEnabled = isOn;
+              MusicStoreService.getInstance().setLyricBlurEnabled(isOn);
+              const state = AppStorageV2.connect(LyricBlurState, AppStorageKeys.LYRIC_BLUR_STATE,
+                () => new LyricBlurState());
+              if (state !== undefined) {
+                state.enabled = isOn;
+              }
+            })
+
+          this.SubTitle($r('app.string.setting_sub_lyric_font_size'))
+          Slider({
+            value: this.lyricFontSize,
+            min: 18,
+            max: 44,
+            step: 1,
+            style: SliderStyle.InSet
+          })
+            .width('100%')
+            .selectedColor(this.themeState.color)
+            .showSteps(false)
+            .showTips(true)
+            .onChange((value: number, mode: SliderChangeMode) => {
+              if (mode === SliderChangeMode.Moving || mode === SliderChangeMode.Click) {
+                this.lyricFontSize = value;
+                MusicStoreService.getInstance().setLyricFontSize(value);
+                const state = AppStorageV2.connect(LyricFontSizeState, AppStorageKeys.LYRIC_FONT_SIZE_STATE,
+                  () => new LyricFontSizeState());
+                if (state !== undefined) {
+                  state.size = value;
+                }
+              }
+            })
+
+          this.SubTitle($r('app.string.setting_sub_keep_screen_on'))
+          this.CapsuleSelector(this.onOffOptions, this.keepScreenOn ? 0 : 1,
+            (index: number) => {
+              const isOn: boolean = index === 0;
+              this.keepScreenOn = isOn;
+              MusicStoreService.getInstance().setKeepScreenOn(isOn);
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 12, bottom: 160 })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+  }
+
+  private downloadQualityMode(): string {
+    const version: number = this.store.downloadQualityVersion;
+    return this.store.getDownloadQualityMode();
+  }
+
+  @Builder
+  private DownloadQualitySettings() {
+    this.SubTitle('下载时选择音质')
+    CapsuleSegmentButtonV2({
+      items: this.downloadQualityModeItems,
+      selectedIndex: this.downloadQualityMode() === 'manual' ? 1 : 0,
+      $selectedIndex: (index: number): void => {
+        this.store.setDownloadQualityMode(index === 1 ? 'manual' : 'follow');
+        console.info('[RzdDownloadQuality] settings mode=' + this.store.getDownloadQualityMode());
+      },
+      buttonBackgroundColor: ColorMetrics.resourceColor($r('app.color.capsule_background')),
+      buttonMinHeight: LengthMetrics.vp(40),
+      buttonBorderRadius: LengthMetrics.vp(20),
+      itemMinHeight: LengthMetrics.vp(40),
+      itemBorderRadius: LengthMetrics.vp(20),
+      itemFontColor: ColorMetrics.resourceColor($r('sys.color.font_primary')),
+      itemSelectedFontColor: ColorMetrics.resourceColor($r('sys.color.font_on_primary')),
+      itemSelectedBackgroundColor: ColorMetrics.resourceColor(this.themeState.color)
+    })
+  }
+
+  /** 下载设置弹窗：音质 / 命名格式 / 质量标签 / 保存位置。 */
+  @Builder
+  private DownloadSheet() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Column() {
+          this.DownloadQualitySettings()
+          this.SubTitle($r('app.string.setting_sub_name_format'))
+          this.CapsuleSelector(this.nameFormatOptions,
+            this.nameFormatValues.indexOf(this.downloadNameFormat),
+            (index: number) => {
+              this.downloadNameFormat = this.nameFormatValues[index];
+              MusicStoreService.getInstance().setDownloadNameFormat(this.downloadNameFormat);
+            })
+
+          this.SubTitle($r('app.string.setting_sub_quality_tag'))
+          this.CapsuleSelector(this.onOffOptions, this.downloadQualityTag ? 0 : 1,
+            (index: number) => {
+              const isOn: boolean = index === 0;
+              this.downloadQualityTag = isOn;
+              MusicStoreService.getInstance().setDownloadQualityTag(isOn);
+            })
+
+          this.SubTitle($r('app.string.setting_sub_save_location'))
+          this.CapsuleSelector(this.saveLocationOptions,
+            this.saveToDownloadDir ? 1 : 0,
+            (index: number) => {
+              this.selectSaveLocation(index === 1);
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 12, bottom: 160 })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+  }
+
+  /** 主题设置弹窗：主题色 / 日夜模式 / 光感，拆为两张卡片。 */
+  @Builder
+  private ThemeSheet() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Column() {
+          this.SubTitle($r('app.string.setting_sub_theme_color'))
+          this.ColorDotRow()
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+
+        Column() {
+          this.SubTitle($r('app.string.setting_sub_color_mode'))
+          this.CapsuleSelector(this.colorModeOptions, this.colorMode,
+            (index: number) => {
+              this.selectColorMode(index);
+            })
+
+          this.SubTitle($r('app.string.setting_sub_ambient'))
+          this.CapsuleSelector(this.ambientOptions, this.ambientLevel,
+            (index: number) => {
+              this.ambientLevel = index;
+              MusicStoreService.getInstance().setAmbientLevel(index);
+              const ambient = AppStorageV2.connect(AmbientState, AppStorageKeys.AMBIENT_STATE,
+                () => new AmbientState());
+              if (ambient !== undefined) {
+                ambient.level = index;
+              }
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 12, bottom: 160 })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+  }
+
+  /** 其它设置弹窗：添加位置 / 首页来源+登录推荐，拆为两张卡片。 */
+  @Builder
+  private OtherSheet() {
+    Scroll() {
+      Column({ space: 12 }) {
+        CoverCacheSettingsCard()
+        Column() {
+          this.SubTitle($r('app.string.setting_sub_add_position'))
+          this.CapsuleSelector(this.addPositionOptions,
+            this.addPositionValues.indexOf(this.playlistAddPosition),
+            (index: number) => {
+              this.playlistAddPosition = this.addPositionValues[index];
+              MusicStoreService.getInstance().setPlaylistAddPosition(this.playlistAddPosition);
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+
+        Column() {
+          this.SubTitle($r('app.string.setting_sub_home_source'))
+          this.CapsuleSelector(this.homeSourceOptions,
+            this.homeSourceValues.indexOf(this.homeSource),
+            (index: number) => {
+              this.homeSource = this.homeSourceValues[index];
+              MusicStoreService.getInstance().setHomeSource(this.homeSource);
+              const state = AppStorageV2.connect(HomeSourceState, AppStorageKeys.HOME_SOURCE_STATE,
+                () => new HomeSourceState());
+              if (state !== undefined) {
+                state.source = this.homeSource;
+              }
+              // 首页这时在另一个 Tab 里：显式通知一次，别只靠 @Monitor（见 HomeSourceBus 注释）
+              notifyHomeSourceRefresh();
+            })
+
+          this.SubTitle($r('app.string.setting_sub_use_account_rec'))
+          this.CapsuleSelector(this.onOffOptions, this.useAccountRec ? 0 : 1,
+            (index: number) => {
+              const isOn: boolean = index === 0;
+              this.useAccountRec = isOn;
+              MusicStoreService.getInstance().setUseAccountRec(isOn);
+              const state = AppStorageV2.connect(UseAccountRecState, AppStorageKeys.USE_ACCOUNT_REC_STATE,
+                () => new UseAccountRecState());
+              if (state !== undefined) {
+                state.enabled = isOn;
+              }
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 4, bottom: 8 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 12, bottom: 160 })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+  }
+
+  /** 关于弹窗：应用信息 / 捐赠 / QQ 群 / 日志。 */
+  @Builder
+  private AboutSheet() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Column() {
+          this.CardTitle($r('app.string.mine_about_title'))
+
+          Row() {
+            Text($r('app.string.mine_about_app_name'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_primary'))
+            Blank()
+            Text($r('app.string.app_name'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_tertiary'))
+          }
+          .width('100%')
+          .height(36)
+          Row() {
+            Text($r('app.string.mine_about_version'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_primary'))
+            Blank()
+            Text($r('app.string.mine_version'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_tertiary'))
+          }
+          .width('100%')
+          .height(36)
+          // ★★ 2026-10-15（修一个**让"装没装上"变成不可判定**的坑）：
+          //   `mine_version` 是**手写资源**（`features/setting/.../base/element/string.json`
+          //   里一个字面量 `1.9.0.3`），**不是读系统的 `bundleManager`** ⇒
+          //   哪怕装了全新的包，这一行也**一字不变** ⇒ 用户无法判断自己装的是哪一版
+          //   （用户实测反馈："我安装过之后似乎没有任何区别" —— 这就是它为什么不可判定）。
+          //   ⇒ 补一行**构建标记** `app.string.build_stamp`：
+          //     · 由构建脚本每次写入（形如 `260101-0000`），**每次构建都不同**；
+          //     · 换过包就一定变 ⇒ "装上了没有"一眼可判（旧包显示旧戳）。
+          //   ⚠️ 它**只用于人眼核对**，不参与任何逻辑；`mine_version` 保持原样（对外版本号）。
+          Row() {
+            Text($r('app.string.mine_about_build'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_primary'))
+            Blank()
+            Text($r('app.string.build_stamp'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_tertiary'))
+          }
+          .width('100%')
+          .height(36)
+          Row() {
+            Text($r('app.string.mine_about_bundle'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_primary'))
+            Blank()
+            Text($r('app.string.mine_bundle_name'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_tertiary'))
+          }
+          .width('100%')
+          .height(36)
+          Row() {
+            Text($r('app.string.mine_about_qq_group'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_primary'))
+            Blank()
+            Text($r('app.string.mine_qq_group'))
+              .fontSize($r('sys.float.Body_M'))
+              .fontColor($r('sys.color.font_tertiary'))
+          }
+          .width('100%')
+          .height(36)
+          .onClick(() => {
+            this.copyQqGroup();
+          })
+
+          Button($r('app.string.mine_donate'))
+            .width('100%')
+            .height(40)
+            .fontSize($r('sys.float.Body_M'))
+            .borderRadius($r('sys.float.corner_radius_level6'))
+            .backgroundColor(this.themeState.color)
+            .fontColor($r('sys.color.font_on_primary'))
+            .margin({ top: 6 })
+            .onClick(() => {
+              this.openDonate();
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 8, bottom: 12 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+
+        Column() {
+          Row() {
+            Text($r('app.string.setting_log_title'))
+              .fontSize($r('sys.float.Body_L'))
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_primary'))
+            Blank()
+            Text($r('app.string.setting_log_copy'))
+              .fontSize($r('sys.float.Caption_L'))
+              .fontColor($r('sys.color.font_tertiary'))
+              .onClick(() => {
+                this.copyPlayLog();
+              })
+            Text($r('app.string.setting_log_refresh'))
+              .fontSize($r('sys.float.Caption_L'))
+              .fontColor($r('sys.color.font_tertiary'))
+              .margin({ left: 12 })
+              .onClick(() => {
+                this.refresh();
+              })
+          }
+          .width('100%')
+
+          if (this.lastError.length > 0) {
+            Text($r('app.string.setting_last_error_title'))
+              .fontSize($r('sys.float.Body_S'))
+              .fontColor($r('sys.color.font_primary'))
+              .width('100%')
+              .alignSelf(ItemAlign.Start)
+            Text(this.lastError)
+              .fontSize($r('sys.float.Caption_S'))
+              .fontColor($r('sys.color.font_tertiary'))
+              .width('100%')
+              .maxLines(4)
+              .alignSelf(ItemAlign.Start)
+          }
+
+          if (this.playLog.length > 0) {
+            Text(this.playLog.length > 6000 ? this.playLog.slice(-6000) : this.playLog)
+              .fontSize($r('sys.float.Caption_S'))
+              .fontFamily('monospace')
+              .fontColor($r('sys.color.font_primary'))
+              .width('100%')
+              .padding(8)
+              .borderRadius($r('sys.float.corner_radius_level4'))
+              .backgroundColor($r('app.color.background_secondary'))
+          } else {
+            Text($r('app.string.setting_log_empty'))
+              .fontSize($r('sys.float.Caption_M'))
+              .fontColor($r('sys.color.font_tertiary'))
+              .width('100%')
+              .padding({ top: 8, bottom: 8 })
+          }
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 8, bottom: 12 })
+        .borderRadius($r('sys.float.corner_radius_level12'))
+        .backgroundColor($r('app.color.card_background'))
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding({ left: 20, right: 20, top: 24, bottom: 160 })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+  }
+
+
+  private isSourceInOrder(apiId: string): boolean {
+    return this.sourceOrderIds.indexOf(apiId) >= 0;
+  }
+
+  private persistSourceOrder(): void {
+    MusicStoreService.getInstance().setSourceScriptOrder(this.sourceOrderIds);
+  }
+
+  /** 勾选/取消参与依次调用的音源。 */
+  /** 长按拖动排序：当前被拖动的音源 id。 */
+  @Local dragSourceId: string = '';
+
+  /** 长按拖动排序：把 dragId 移到 targetId 的位置。 */
+  private moveSourceTo(dragId: string, targetId: string): void {
+    if (dragId.length === 0 || dragId === targetId) {
+      return;
+    }
+    const from: number = this.sourceOrderIds.indexOf(dragId);
+    const to: number = this.sourceOrderIds.indexOf(targetId);
+    if (from < 0 || to < 0) {
+      return;
+    }
+    const next: string[] = [];
+    for (let i: number = 0; i < this.sourceOrderIds.length; i++) {
+      next.push(this.sourceOrderIds[i]);
+    }
+    next.splice(from, 1);
+    next.splice(to, 0, dragId);
+    this.sourceOrderIds = next;
+    this.persistSourceOrder();
+    this.dragSourceId = '';
+    console.info('[RzdSourceOrder] move ' + dragId + ' -> ' + targetId + ' = ' + next.join(' > '));
+  }
+
+  private toggleSourceInOrder(apiId: string): void {
+    const idx: number = this.sourceOrderIds.indexOf(apiId);
+    if (idx >= 0) {
+      const next: string[] = [];
+      for (let i: number = 0; i < this.sourceOrderIds.length; i++) {
+        if (i !== idx) {
+          next.push(this.sourceOrderIds[i]);
+        }
+      }
+      this.sourceOrderIds = next;
+    } else {
+      const next: string[] = [];
+      for (let i: number = 0; i < this.sourceOrderIds.length; i++) {
+        next.push(this.sourceOrderIds[i]);
+      }
+      next.push(apiId);
+      this.sourceOrderIds = next;
+    }
+    this.persistSourceOrder();
+  }
+
+
+  /** 按用户排序展示的音源列表：已勾选在前且按顺序，未勾选在后。 */
+  private orderedApiListForUi(): LXUserApiInfo[] {
+    const byId: Map<string, LXUserApiInfo> = new Map();
+    for (let i: number = 0; i < this.lxApiList.length; i++) {
+      byId.set(this.lxApiList[i].id, this.lxApiList[i]);
+    }
+    const out: LXUserApiInfo[] = [];
+    const seen: Record<string, boolean> = {};
+    for (let i: number = 0; i < this.sourceOrderIds.length; i++) {
+      const id: string = this.sourceOrderIds[i];
+      const api: LXUserApiInfo | undefined = byId.get(id);
+      if (api !== undefined) {
+        out.push(api);
+        seen[id] = true;
+      }
+    }
+    for (let i: number = 0; i < this.lxApiList.length; i++) {
+      if (!seen[this.lxApiList[i].id]) {
+        out.push(this.lxApiList[i]);
+      }
+    }
+    return out;
+  }
+
+  /** 音源管理弹窗：源列表 + 导入按钮。 */
+  @Builder
+  private SourceManagerSheet() {
+    Column({ space: 12 }) {
+      Text($r('app.string.setting_group_source'))
+        .fontSize($r('sys.float.Subtitle_L'))
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('sys.color.font_primary'))
+        .width('100%')
+        .textAlign(TextAlign.Center)
+
+      if (this.lxApiList.length === 0) {
+        Text($r('app.string.setting_lx_empty'))
+          .fontSize($r('sys.float.Body_S'))
+          .fontColor($r('sys.color.font_tertiary'))
+          .width('100%')
+      }
+
+      Scroll() {
+        Column({ space: 8 }) {
+          Text('勾选参与依次调用；第一个勾选的是默认音源，长按卡片可拖动排序')
+            .fontSize($r('sys.float.Caption_M'))
+            .fontColor($r('sys.color.font_tertiary'))
+            .width('100%')
+
+          // 统一实现：单列勾选 + 整卡拖动 + 左滑（检查更新 / 删除）
+          SourceManagerList({
+            apis: this.orderedApiListForUi(),
+            orderIds: this.sourceOrderIds,
+            activeId: this.activeSource,
+            accentColor: this.themeState.color,
+            draggableEnabled: this.engineReady,
+            onToggle: (apiId: string): void => {
+              this.toggleSourceInOrder(apiId);
+            },
+            onSelect: (apiId: string): void => {
+              this.selectLXSource(apiId);
+            },
+            onShare: (api: LXUserApiInfo): void => {
+        this.shareSourceFile(api);
+      },
+      onDelete: (apiId: string): void => {
+              this.deleteLXSource(apiId);
+            },
+            onCheckUpdate: (api: LXUserApiInfo): void => {
+              void this.checkSourceUpdate(api);
+            },
+            onMove: (dragId: string, targetId: string): void => {
+              this.moveSourceTo(dragId, targetId);
+            }
+          })
+
+          Row({ space: 10 }) {
+            Button($r('app.string.setting_lx_import_file'))
+              .layoutWeight(1)
+              .height(42)
+              .fontSize($r('sys.float.Body_M'))
+              .backgroundColor(this.themeState.color)
+              .fontColor($r('sys.color.font_on_primary'))
+              .onClick(() => {
+                void this.importLXSource();
+              })
+            Button($r('app.string.setting_lx_import_online'))
+              .layoutWeight(1)
+              .height(42)
+              .fontSize($r('sys.float.Body_M'))
+              .backgroundColor(this.themeState.color)
+              .fontColor($r('sys.color.font_on_primary'))
+              .onClick(() => {
+                this.openSettingSheet(0);
+              })
+          }
+          .width('100%')
+        }
+        .width('100%')
+      }
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 20, right: 20, top: 24, bottom: 160 })
+  }
+
+  /**
+   * 分享音源脚本文件本身（用户 2026-11-01：左滑「分享」分享的是脚本文件）。
+   *
+   * ★ 2026-11-01 二次修（用户：点了没反应）：查了官方文档《分享数据创建及分享面板拉起》，
+   *   `ShareController.show(context, options)` **返回 Promise**，不接 then/catch 的话一旦失败就"静默无反应"。
+   *   现在：① 用 `uniformTypeDescriptor.UniformDataType.PLAIN_TEXT`（脚本是文本）；
+   *        ② show 的 Promise 显式 then/catch 并写进应用内日志（`[RzdSourceShare]`）；
+   *        ③ 失败回退 `startAbility(sendData)`，再失败才 toast。
+   */
+  private async shareSourceFile(api: LXUserApiInfo): Promise<void> {
+    appendPlayLog('[RzdSourceShare] tap id=' + api.id + ' name=' + api.name);
+    const ctx: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    try {
+      const raw: string = await lxSourceManager.getScript(api.id);
+      appendPlayLog('[RzdSourceShare] script len=' + raw.length);
+      if (raw.length === 0) {
+        this.getUIContext().getPromptAction().showToast({ message: '读不到脚本文件，无法分享', duration: 2000 });
+        return;
+      }
+      const bad: RegExp = new RegExp('[\\\\/:*?"<>|]', 'g');
+      const safeName: string = (api.name.length > 0 ? api.name : 'source').replace(bad, '_');
+      const ver: string = api.version.length > 0 ? ('_v' + api.version.replace(bad, '_')) : '';
+      const fileName: string = safeName + ver + '.js';
+      const path: string = ctx.cacheDir + '/' + fileName;
+      const file: fs.File = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(file.fd, raw);
+      fs.closeSync(file);
+      const uri: string = fileUri.getUriFromPath(path);
+      appendPlayLog('[RzdSourceShare] file=' + fileName + ' uri=' + uri);
+      // ① 官方推荐：ShareKit 系统分享面板（show 返回 Promise，必须接住）
+      try {
+        const shareData: systemShare.SharedData = new systemShare.SharedData({
+          utd: uniformTypeDescriptor.UniformDataType.PLAIN_TEXT,
+          uri: uri,
+          title: fileName
+        });
+        const controller: systemShare.ShareController = new systemShare.ShareController(shareData);
+        await controller.show(ctx, {
+          selectionMode: systemShare.SelectionMode.SINGLE,
+          previewMode: systemShare.SharePreviewMode.DEFAULT
+        });
+        appendPlayLog('[RzdSourceShare] sharekit show ok');
+        return;
+      } catch (e1) {
+        appendPlayLog('[RzdSourceShare] sharekit failed ' + JSON.stringify(e1).substring(0, 160));
+      }
+      // ② 回退：文件处理类应用（sendData）
+      const want: Want = {
+        action: 'ohos.want.action.sendData',
+        uri: uri,
+        type: 'text/plain',
+        flags: wantConstant.Flags.FLAG_AUTH_READ_URI_PERMISSION
+      };
+      await ctx.startAbility(want);
+      appendPlayLog('[RzdSourceShare] startAbility sendData ok');
+    } catch (err) {
+      appendPlayLog('[RzdSourceShare] failed ' + JSON.stringify(err).substring(0, 160));
+      this.getUIContext().getPromptAction().showToast({ message: '分享失败', duration: 2000 });
+    }
+  }
+  private applyCustomColor(): void {
+    this.applyThemeColor(this.customColor.trim());
+    this.closeSettingSheet();
+  }
+
+  @Builder
+  private GroupDivider() {
+    Divider()
+      .strokeWidth(0.5)
+      .color($r('sys.color.comp_divider'))
+      .margin({ left: 16, right: 12 })
+  }
+
+  @Builder
+  private SettingsNavBarContent() {
+    Scroll(this.pageScroller) {
+      Column({ space: 12 }) {
+        Search({ value: this.searchKeyword, placeholder: $r('app.string.setting_search_placeholder') })
+          .id('setting_search_input')
+          .width('100%')
+          .height(40)
+          .borderWidth(1)
+          .borderColor($r('app.color.comp_background_list_card'))
+          .borderRadius(24)
+          .backgroundColor($r('app.color.comp_background_list_card'))
+          .onChange((value: string) => {
+            this.searchKeyword = value;
+          })
+        // ★ 用户 2026-10-11：原来这里那张「登录音乐」大卡片**搬到「我的」页顶部**了
+        //   （抽成 `LoginMusicCard.ets`，我的页调它）。设置页里**不再有**这张卡，
+        //   所以这里只删掉那一行调用 —— `LoginAccountCard()` 这个 Builder 与其余设置项一律不动。
+        this.SourceEntry()
+        this.PlaybackDownloadEntry()
+        this.ThemeEntry()
+        this.OtherAboutEntry()
+        Blank()
+      }
+      .width('100%')
+      .padding({
+        // ★ 2026-10-11（用户：「我想让它延伸进状态栏」）：这段留白在**滚动内容里**
+        //   （`Scroll` 的内容根 `Column` 的 padding），所以必须含状态栏那一段。
+        //   ⚠️ 但"该让多少"不能假设页盒从 y=0 起排 —— 框架有可能把页盒限制在安全区内
+        //   （实测：用户装机后标题/内容整体下移一个状态栏，说明盒顶不是 0）。
+        //   现在由 `boxTopVp`（页根 `onAreaChange` 实测）算：盒顶 0 → 94；盒顶 38 → 56，
+        //   两种情形内容都落在窗口的 94 那条线上（详见 `PageTopInsetHelper`）。
+        //   上滑时内容从标题栏底下**再穿进状态栏** —— 靠下面 `Scroll` 自己那句
+        //   `clipContent(ContentClipMode.SAFE_AREA)`（`Scroll` 默认 `BOUNDARY`，按组件区域裁）。
+        top: PageTopInsetHelper.contentOffsetVp(this.boxTopVp),
+        left: new BreakpointType(12, 16, 24, 24).getValue(this.breakpointEnv.widthBreakpoint),
+        right: new BreakpointType(12, 16, 24, 24).getValue(this.breakpointEnv.widthBreakpoint)
+      })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
+    .align(Alignment.Top)
+    // ★★ 让内容能画进状态栏（"延伸进状态栏"）的**官方正解**：
+    //   官方《开发应用沉浸式效果》→「滚动类场景」② —— 设置滚动容器的内容裁剪属性
+    //   `clipContent(ContentClipMode.SAFE_AREA)`，**将内容层裁剪区域扩展至避让区**。
+    //   `Scroll` 的默认值是 `ContentClipMode.BOUNDARY`（按组件区域裁）⇒ 内容到状态栏那条会被裁掉。
+    //   ⚠️ 链上任何祖先都**不能**再写 `clip(true)`（官方："需要确保父组件未设置 clip 等裁剪属性"）——
+    //   本页「页根 → 滚动容器」这条链上**没有**内容容器，`Scroll` 就是 HdsNavDestination 的一级子节点。
+    .clipContent(ContentClipMode.SAFE_AREA)
+    // ★ 底部"给悬浮播放条让位"的留白留在**滚动内容里**（`contentEndOffset` = 内容末端到显示区
+    //   边界的距离，官方 `ScrollableCommonMethod` @since 22，List/Scroll 通用）—— 它随内容一起滚走。
+    //   原来写的是**内容根 `Column` 的 `padding({ bottom: 72 })`**：作用域也在滚动内容里、效果相同，
+    //   这里换成与 `RecordListPage` / `SettingsDetailPage` / 其它页**完全同一口径**。
+    //   反面做法（禁）：写在外层容器的 `padding({ bottom })` 上 —— 那是固定在屏幕底部的死带。
+    .contentEndOffset(72)
+    // 滚动联动双层底栏：上滑收起、下滑展开（与首页/歌单/我的一致）
+    .onScrollFrameBegin((offset: number): OnScrollFrameBeginHandlerResult => {
+      if (BarScrollHelper.isEnabled()) {
+        BarScrollHelper.notifyScrollDelta(this.getUIContext(), this.appState, offset,
+          this.breakpointEnv.widthBreakpoint as number);
+      }
+      return { offsetRemain: offset };
+    })
+  }
+
+  build() {
+    HdsNavDestination() {
+      if (this.isWideSettingLayout()) {
+        Row() {
+          Column() {
+            this.SettingsNavBarContent()
+          }
+          .width(this.navBarWidthValue())
+          .height('100%')
+
+          SettingsDetailPage({
+            embedded: true,
+            sheetIndex: this.selectedIndex >= 0 ? this.selectedIndex : 4
+          })
+          .layoutWeight(1)
+          .height('100%')
+        }
+        .width('100%')
+        .height('100%')
+      } else {
+        this.SettingsNavBarContent()
+      }
+    }
+    .onBackPressed((): boolean => guardPlayerBack('SettingPage'))
+    .hideTitleBar(false)
+    // ★ 这一页现在**只作为二级页**存在（原来的「设置」页签已被「我的」页取代，
+    //   入口 = 「我的」→ 入口卡「设置」，见 `MinePage.linkRows()` / `onLinkTap()`），
+    //   所以必须显示返回箭头 —— 以前它是页签页、没有"上一页"可回，才写的 true。
+    .hideBackButton(false)
+    .titleBar(this.getTitleBar())
+    .titleMode(HdsNavDestinationTitleMode.MINI)
+    .bindToScrollable([this.pageScroller])
+    .backgroundColor($r('app.color.background_secondary'))
+    // ★★ 状态栏三件套（2026-10-11 定稿，用户第三次纠正后）：
+    //   ① `expandSafeArea(TOP,BOTTOM)`：把**页面底色**铺到状态栏/导航条那两条（只扩绘制区）；
+    //   ② `ignoreLayoutSafeArea(...[TOP, BOTTOM])` —— **TOP 必须给**：HDS 标题栏自己会按"状态栏高度"
+    //      往下让位，所以**页面盒子必须从屏幕 y=0 起排**；只写 BOTTOM 变成"盒子让一次 + 标题栏再让一次"
+    //      ⇒ 整条标题掉到状态栏下面约一个状态栏高度（用户原话「整个标题移到了状态栏下面」），
+    //      内容也跟着多顶 38vp（「上方留的空距有点大了」）。
+    //      盒子从 0 起排后：标题栏 = 38..94 ✔，`SettingsNavBarContent` 里那个
+    //      `padding top`（状态栏 + 56 = 94）正好落在 94 ✔。
+    //      ⚠️ 旧注释里"根节点带 TOP 会把标题顶进状态栏 / 只能留 BOTTOM"那句**是错的**，已作废。
+    //   ③ 滚动容器 `clipContent(ContentClipMode.SAFE_AREA)` + 祖先链零 `clip(true)`：
+    //      内容能**画进**状态栏那一条。
+    // ★★ 用户 2026-10-11：「顶栏标题错位的问题还在，你应该参考一下其他显示正常的页面是怎么写的」。
+    //   逐页对比后：显示正常的 MinePage / RecommendPage **都没有** expandSafeArea，
+    //   而所有标题偏低的页面都有 ⇒ 照正常页面去掉它（官方语义：expandSafeArea 只延伸**绘制区**，
+    //   「子组件相对屏幕位置不变」，但它会让 HDS 标题栏的定位多让一次）。
+    //   页面底色由页盒自身 ackgroundColor 铺满（盒顶 = 0，实测见 RzdPageTopInset），不需要它补状态栏那一条。
+    .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    // ★ 实测页盒顶边（窗口坐标 vp）。这是本页两个顶部量的**唯一输入**：
+    //   内容让位 `PageTopInsetHelper.contentOffsetVp(boxTopVp)` 与标题栏的
+    //   `avoidLayoutSafeArea`。用户装机反复报「标题下移 / 上方留白大」就是因为它此前被写死成 0。
+    //   只在变化超过 0.5vp 时才写状态，避免和布局互相追着改。
+    .onAreaChange((_oldArea: Area, newArea: Area): void => {
+      const top: number = newArea.globalPosition.y as number;
+      if (Math.abs(top - this.boxTopVp) > 0.5) {
+        this.boxTopVp = top;
+        hilog.info(DOMAIN, TAG, 'RzdPageTopInset boxTopVp=%{public}f page=setting offset=%{public}f avoid=%{public}s',
+          top, PageTopInsetHelper.contentOffsetVp(top),
+          String(PageTopInsetHelper.avoidLayoutSafeArea(top)));
+      }
+    })
+    .bindSheet(this.showSettingSheet, this.SettingSheetBuilder(), {
+      height: this.activeSettingSheet === 0 ? 280 :
+        (this.activeSettingSheet === 1 ? 340 :
+          (this.activeSettingSheet === 2 ? 620 :
+            (this.activeSettingSheet === 3 ? 640 :
+              (this.activeSettingSheet === 4 ? 620 :
+                (this.activeSettingSheet === 5 ? 480 :
+                  (this.activeSettingSheet === 6 ? 360 :
+                    (this.activeSettingSheet === 7 ? 520 :
+                      (this.activeSettingSheet === 8 ? 400 :
+                    (this.activeSettingSheet === 10 ? 560 : 480))))))))),
+      dragBar: true,
+      showClose: false,
+      backgroundColor: $r('app.color.background_secondary'),
+      onWillDismiss: (action: DismissSheetAction) => {
+        this.onSheetWillDismiss(action);
+      },
+      onDisappear: (): void => {
+        this.onSheetDisappear();
+      }
+    })
+  }
+
+  @Builder
+  private SettingsGroupCard(entries: Array<SettingsEntry>) {
+    Column() {
+      ForEach(entries, (entry: SettingsEntry, index?: number) => {
+        Row({ space: 12 }) {
+          Image(entry.icon)
+            .width(32)
+            .height(32)
+          Column({ space: 2 }) {
+            Text(entry.title)
+              .fontSize(16)
+              .fontWeight(this.selectedIndex === entry.id ? FontWeight.Bold : FontWeight.Medium)
+              .fontColor(this.selectedIndex === entry.id ? '#0A59F7' : $r('sys.color.font_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            if (entry.subtitle.length > 0) {
+              Text(entry.subtitle)
+                .fontSize(11)
+                .fontColor($r('sys.color.font_tertiary'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          SymbolGlyph($r('sys.symbol.chevron_right'))
+            .fontSize(20)
+            .fontWeight(FontWeight.Regular)
+            .height(20)
+            .fontColor([$r('sys.color.icon_tertiary')])
+        }
+        .width('100%')
+        .height(56)
+        .padding({ left: 16, right: 12 })
+        .borderRadius(12)
+        .backgroundColor(this.selectedIndex === entry.id ? $r('app.color.background_secondary') : Color.Transparent)
+        .onClick(() => {
+          entry.onClick();
+        })
+
+        if (index !== undefined && index < entries.length - 1) {
+          this.GroupDivider()
+        }
+      }, (entry: SettingsEntry, index?: number) => 'entry-' + index)
+    }
+    .width('100%')
+    .padding({ top: 4, bottom: 4 })
+    .borderRadius($r('sys.float.corner_radius_level16'))
+    .backgroundColor($r('app.color.comp_background_list_card'))
+  }
+
+  /** 搜索过滤：返回与当前关键词匹配的设置项（空关键词返回全部）。 */
+  private filterEntries(entries: SettingsEntry[]): SettingsEntry[] {
+    const kw: string = this.searchKeyword.trim().toLowerCase();
+    if (kw.length === 0) {
+      return entries;
+    }
+    const result: SettingsEntry[] = [];
+    for (const entry of entries) {
+      const text: string = (entry.searchText + ' ' + entry.subtitle).toLowerCase();
+      if (text.indexOf(kw) >= 0) {
+        result.push(entry);
+      }
+    }
+    return result;
+  }
+
+  /** 判断登录音乐/平台音乐整行是否匹配搜索关键词。 */
+  private rowVisible(title: string, subtitle: string): boolean {
+    const kw: string = this.searchKeyword.trim().toLowerCase();
+    if (kw.length === 0) {
+      return true;
+    }
+    return (title + ' ' + subtitle).toLowerCase().indexOf(kw) >= 0;
+  }
+
+  @Builder
+  private SourceEntry() {
+    if (this.filterEntries(this.sourceEntries()).length > 0) {
+      this.SettingsGroupCard(this.filterEntries(this.sourceEntries()))
+    }
+  }
+
+  @Builder
+  private PlaybackDownloadEntry() {
+    if (this.filterEntries(this.playbackDownloadEntries()).length > 0) {
+      this.SettingsGroupCard(this.filterEntries(this.playbackDownloadEntries()))
+    }
+  }
+
+  @Builder
+  private ThemeEntry() {
+    if (this.filterEntries(this.themeEntries()).length > 0) {
+      this.SettingsGroupCard(this.filterEntries(this.themeEntries()))
+    }
+  }
+
+  @Builder
+  private OtherAboutEntry() {
+    if (this.filterEntries(this.otherAboutEntries()).length > 0) {
+      this.SettingsGroupCard(this.filterEntries(this.otherAboutEntries()))
+    }
+  }
+
+  /** 设置数据：音源设置（超级终端图标）。 */
+  private sourceEntries(): SettingsEntry[] {
+    const source = new SettingsEntry();
+    source.icon = $r('app.media.ic_super_device');
+    source.title = $r('app.string.setting_group_source');
+    source.subtitle = '';
+    source.id = 5;
+    source.searchText = '音源设置 音源 引擎';
+    source.onClick = (): void => {
+      this.openSettingSheet(5);
+    };
+    return [source];
+  }
+
+  /** 设置数据：播放设置（声音和震动图标）+ 下载设置。 */
+  private playbackDownloadEntries(): SettingsEntry[] {
+    const playback = new SettingsEntry();
+    playback.icon = $r('app.media.ic_voice');
+    playback.title = $r('app.string.setting_group_playback');
+    playback.subtitle = '';
+    playback.id = 4;
+    playback.searchText = '播放设置 播放 音质 歌词 声音';
+    playback.onClick = (): void => {
+      this.openSettingSheet(4);
+    };
+    const download = new SettingsEntry();
+    download.icon = $r('app.media.ic_store');
+    download.title = $r('app.string.setting_group_download');
+    download.subtitle = '';
+    download.id = 6;
+    download.searchText = '下载设置 下载 保存 命名';
+    download.onClick = (): void => {
+      this.openSettingSheet(6);
+    };
+    return [playback, download];
+  }
+
+  /** 设置数据：主题设置（桌面和个性化图标）。 */
+  private themeEntries(): SettingsEntry[] {
+    const theme = new SettingsEntry();
+    theme.icon = $r('app.media.ic_desktop');
+    theme.title = $r('app.string.setting_group_theme');
+    theme.subtitle = '';
+    theme.id = 7;
+    theme.searchText = '主题设置 主题 颜色 日夜';
+    theme.onClick = (): void => {
+      this.openSettingSheet(7);
+    };
+    return [theme];
+  }
+
+  /** 设置数据：其它设置（辅助功能图标）+ 关于（系统图标）。 */
+  private otherAboutEntries(): SettingsEntry[] {
+    const other = new SettingsEntry();
+    other.icon = $r('app.media.ic_accessibility');
+    other.title = $r('app.string.setting_group_other');
+    other.subtitle = '';
+    other.id = 8;
+    other.searchText = '其它设置 其他 歌单 首页 推荐';
+    other.onClick = (): void => {
+      this.openSettingSheet(8);
+    };
+    const about = new SettingsEntry();
+    about.icon = $r('app.media.ic_system');
+    about.title = $r('app.string.mine_about_title');
+    about.subtitle = '';
+    about.id = 9;
+    about.searchText = '关于 版本 捐赠 日志 群';
+    about.onClick = (): void => {
+      this.openSettingSheet(9);
+    };
+    return [other, about];
+  }
+
+  /** 登录音乐 大卡片（按顶部搜索词过滤行）。 */
+  @Builder
+  private LoginAccountCard() {
+    if (this.rowVisible('登录音乐', '网易云 / QQ / 酷狗账号，扫码或 Cookie 登录')) {
+      Column({ space: 8 }) {
+      if (this.rowVisible('登录音乐', '网易云 / QQ / 酷狗账号，扫码或 Cookie 登录')) {
+        Row({ space: 12 }) {
+          // 登录过华为账号：图标与文字都换成华为账号的头像 / 昵称（用户要求）
+          if (this.huaweiState.signedIn) {
+            if (this.huaweiState.avatarUri.length > 0) {
+              // 头像可能已经是沙箱本地图（Account Kit 那条路会先落盘）：走 LocalCoverImage
+              LocalCoverImage({
+                src: this.huaweiState.avatarUri,
+                imageWidth: 64,
+                imageHeight: 64,
+                radius: 32,
+                fit: ImageFit.Cover
+              })
+            } else {
+              Column() {
+                SymbolGlyph($r('sys.symbol.person_crop_circle_fill_1'))
+                  .fontSize(64)
+                  .fontWeight(FontWeight.Regular)
+                  .height(64)
+                  .fontColor([$r('sys.color.font_tertiary')])
+              }
+              .width(64)
+              .height(64)
+              .justifyContent(FlexAlign.Center)
+              .alignItems(HorizontalAlign.Center)
+            }
+          } else {
+            Column() {
+              SymbolGlyph($r('sys.symbol.person_crop_circle_fill_1'))
+                .fontSize(64)
+                .fontWeight(FontWeight.Regular)
+                .height(64)
+                .fontColor([$r('sys.color.font_tertiary')])
+            }
+            .width(64)
+            .height(64)
+            .justifyContent(FlexAlign.Center)
+            .alignItems(HorizontalAlign.Center)
+          }
+
+          Column({ space: 2 }) {
+            Text(this.huaweiState.signedIn ?
+              (this.huaweiState.nickName.length > 0 ? this.huaweiState.nickName : '华为账号') : '登录音乐')
+              .fontSize(20)
+              .fontWeight(this.selectedIndex === 2 ? FontWeight.Bold : FontWeight.Medium)
+              .fontColor(this.selectedIndex === 2 ? '#0A59F7' : $r('sys.color.font_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(this.huaweiState.signedIn ?
+              '已登录华为账号 · 网易云 / QQ / 酷狗账号在这里管理' :
+              '网易云 / QQ / 酷狗账号，扫码或 Cookie 登录')
+              .fontSize(12)
+              .fontColor($r('sys.color.font_tertiary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          SymbolGlyph($r('sys.symbol.chevron_right'))
+            .fontSize(20)
+            .fontWeight(FontWeight.Regular)
+            .height(20)
+            .fontColor([$r('sys.color.icon_tertiary')])
+        }
+        .width('100%')
+        .height(80)
+        .borderRadius(16)
+        .padding({ left: 8, right: 12 })
+        .backgroundColor(this.selectedIndex === 2 ? $r('app.color.background_secondary') : Color.Transparent)
+        .onClick(() => {
+          this.openSettingSheet(2);
+        })
+      }
+    }
+    .width('100%')
+    .padding({ top: 4, bottom: 4 })
+    .borderRadius($r('sys.float.corner_radius_level16'))
+    .backgroundColor($r('app.color.comp_background_list_card'))
+      }
+  }
+}
+
+/**
+ * 路由表里注册的 Builder（`features/setting` 的 `router_map.json`）。
+ *
+ * ★ 用户 2026-10-11：设置页用回**我们原本这个大的设置页本体**（原来它是底栏第 4 个页签；
+ *   页签收成「推荐 / 我的」两个之后，改成从「我的」页入口卡的那一行进来）——
+ *   **不是副本、也没有重写**，`router_map.json` 里指的就是本文件。
+ *
+ * 这一页**没有必填 `@Param`**（`scrollTopCommand` 有默认值 0），所以这里直接
+ * `SettingPage()`、不传参数；它自己是 `HdsNavDestination` 根节点，被壳层那条共享
+ * `HdsNavigation` 推出来就是正常的二级页（页内的 `@Consumer('pageIndexInfos')` 拿到的
+ * 就是壳层共享栈，推设置详情页照旧）。
+ */
+@Builder
+export function SettingPageBuilder(name: string, param: Object) {
+  SettingPage()
+}
+

@@ -1,0 +1,77 @@
+{
+  "module": {
+    "name": "musichomepcsample",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "MusichomePcAbility",
+    "deviceTypes": [
+      "2in1"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.INTERNET"
+      },
+      {
+        "name": "ohos.permission.GET_NETWORK_INFO"
+      },
+      // 智感握姿（motion.on('operatingHandChanged')）需要的系统级权限，声明即生效。
+      {
+        "name": "ohos.permission.DETECT_GESTURE"
+      }
+    ],
+    "abilities": [
+      {
+        "name": "MusichomePcAbility",
+        "srcEntry": "./ets/pcability/PcAbility.ets",
+        "description": "$string:PcAbility_desc",
+        "icon": "$media:ic_music_icon",
+        "label": "$string:PcAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "minWindowWidth": 1080,
+        "minWindowHeight": 500,
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "ohos.want.action.home"
+            ]
+          },
+          {
+            // 「用派音打开 .js」= 导入音源脚本（与手机壳层同一份声明，见官方「拉起文件处理类应用」）
+            "actions": [
+              "ohos.want.action.viewData"
+            ],
+            "uris": [
+              {
+                "scheme": "file",
+                "type": "general.java-script",
+                "linkFeature": "FileOpen"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "extensionAbilities": [
+      {
+        "name": "MusichomePcBackupAbility",
+        "srcEntry": "./ets/pcbackupability/PcBackupAbility.ets",
+        "type": "backup",
+        "exported": false,
+        "metadata": [
+          {
+            "name": "ohos.extension.backup",
+            "resource": "$profile:backup_config"
+          }
+        ],
+      }
+    ]
+  }
+}

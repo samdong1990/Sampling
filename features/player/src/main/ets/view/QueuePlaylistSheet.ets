@@ -1,0 +1,253 @@
+/*
+ * Copyright (c) 2026 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { AppStorageV2 } from '@kit.ArkUI';
+import { AppStorageKeys, PlaybackIntentState, SongItem, SongTitleMarquee, StyleConstants, ThemeState } from 'musicbasic';
+import { MusicAppState } from '../model/PlayerModels';
+import { MediaService } from '../model/MediaService';
+
+/**
+ * Lazy queue data source: resolves rows on demand from the live play queue so
+ * long queues (hundreds of songs) never materialize all rows at once.
+ */
+class QueueSongDataSource implements IDataSource {
+  private listener: DataChangeListener | undefined = undefined;
+  private readonly state: MusicAppState;
+
+  constructor(state: MusicAppState) {
+    this.state = state;
+  }
+
+  totalCount(): number {
+    return this.state.getQueueLength();
+  }
+
+  getData(index: number): SongItem | undefined {
+    return this.state.resolveSongAtQueueIndex(index);
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    this.listener = listener;
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    if (this.listener === listener) {
+      this.listener = undefined;
+    }
+  }
+
+  reload(): void {
+    if (this.listener !== undefined) {
+      this.listener.onDataReloaded();
+    }
+  }
+}
+
+/**
+ * Reusable current-play-queue bottom sheet: header with count, lazy list rows with
+ * jump-to-play and per-row removal. Hosts render a tiny anchor and drive {@link isShow}.
+ */
+@ComponentV2
+export struct QueuePlaylistSheet {
+  /** Parent-driven visibility; reset via {@link onDismiss} after the user closes the sheet. */
+  @Param isShow: boolean = false;
+  /** Invoked when the sheet is closed by the user (drag down / close icon). */
+  @Event onDismiss: () => void = (): void => {};
+  /** Global playback and queue state. */
+  @Local appState: MusicAppState =
+    AppStorageV2.connect(MusicAppState, AppStorageKeys.MUSIC_APP_STATE, () => new MusicAppState())!;
+  /** App accent color for the current-track highlight. */
+  @Local themeState: ThemeState =
+    AppStorageV2.connect(ThemeState, AppStorageKeys.THEME_STATE, () => new ThemeState())!;
+  /** Lazy queue rows data source. */
+  @Local queueSource: QueueSongDataSource = new QueueSongDataSource(this.appState);
+
+  private queueScroller: Scroller = new Scroller();
+
+  private locateCurrentSong(): void {
+    const index: number = this.appState.selectIndex;
+    const count: number = this.appState.getQueueLength();
+    if (index < 0 || index >= count) {
+      return;
+    }
+    this.queueScroller.scrollToIndex(index, true, ScrollAlign.CENTER);
+    console.info('[RzdQueueLocate] locate index=' + index + ' count=' + count);
+  }
+
+  /** Refreshes the lazy queue source when the queue or the current index changes. */
+  @Monitor('appState.playQueue', 'appState.playQueueIds', 'appState.selectIndex')
+  onQueueChanged(): void {
+    this.queueSource.reload();
+  }
+
+  aboutToAppear(): void {
+    this.queueSource = new QueueSongDataSource(this.appState);
+  }
+
+  /** Whether the given queue index is the currently playing track. */
+  private isCurrentQueueIndex(index: number): boolean {
+    return index === this.appState.selectIndex;
+  }
+
+  /** Request playback through the existing shell dispatcher without opening a new player page. */
+  private playQueueIndex(index: number): void {
+    if (index < 0 || index >= this.appState.getQueueLength()) {
+      return;
+    }
+    const intent: PlaybackIntentState = AppStorageV2.connect(PlaybackIntentState,
+      AppStorageKeys.PLAYBACK_INTENT_STATE, () => new PlaybackIntentState())!;
+    intent.pendingPlaySongId = -1;
+    intent.pendingQueueIndex = index;
+    intent.openPlayerUi = false;
+    intent.requestVersion++;
+  }
+
+  /** Removes the song at the given queue index from the play queue. */
+  private removeQueueIndex(index: number): void {
+    MediaService.getInstance().removeQueueIndex(index);
+  }
+
+  /** One queue row: cover, title, singer, playing indicator, and remove button. */
+  @Builder
+  QueueSongRow(song: SongItem, index: number) {
+    Row({ space: 12 }) {
+      Image(song.cover.length > 0 ? song.cover : $r('app.media.ic_avatar1'))
+        .width(44)
+        .height(44)
+        .borderRadius($r('sys.float.corner_radius_level3'))
+        .objectFit(ImageFit.Cover)
+      Column({ space: 4 }) {
+        // ★ 2026-10-15：歌名过长改跑马灯（用户要求「各个页面歌曲名过长时改为用跑马灯显示」）。
+        //   字号/字重/字色逐字保留（字色仍是"当前播放行用主题色、其余用 font_primary"）；
+        //   父容器是 `Column` ⇒ 用组件默认的 `fillByWidth`（内部 `width('100%')`）约束宽度。
+        SongTitleMarquee({
+          text: song.title,
+          titleFontSize: $r('sys.float.Body_M'),
+          titleFontColor: this.isCurrentQueueIndex(index) ? this.themeState.color : $r('app.color.font_primary'),
+          titleFontWeight: FontWeight.Medium
+        })
+        Text(song.singer)
+          .fontSize($r('sys.float.Caption_M'))
+          .fontColor($r('app.color.font_tertiary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      if (this.isCurrentQueueIndex(index)) {
+        SymbolGlyph($r('sys.symbol.speaker_wave_2_fill'))
+          .fontSize(18)
+          .fontWeight(FontWeight.Regular)
+          .fontColor([this.themeState.color])
+      }
+      SymbolGlyph($r('sys.symbol.trash'))
+        .fontSize(18)
+        .fontWeight(FontWeight.Regular)
+        .fontColor([$r('app.color.font_tertiary')])
+        .width(32)
+        .height(32)
+        .accessibilityText('从播放列表移除')
+        .accessibilityLevel('yes')
+        .onClick(() => {
+          this.removeQueueIndex(index);
+        })
+    }
+    .width(StyleConstants.FULL_WIDTH)
+    .padding({ top: 12, bottom: 12 })
+    .onClick(() => {
+      this.playQueueIndex(index);
+    })
+  }
+
+  /** Sheet content: scrollable queue rows with nested scroll for detent dragging. */
+  @Builder
+  SheetContent() {
+    Column() {
+      List({ scroller: this.queueScroller }) {
+        LazyForEach(this.queueSource, (song: SongItem, index: number) => {
+          ListItem() {
+            this.QueueSongRow(song, index);
+          }
+        }, (song: SongItem, index: number) => song.source.length > 0 ?
+          `queue-${song.source}-${song.songId}` : `queue-local-${song.id}`)
+      }
+      .width(StyleConstants.FULL_WIDTH)
+      .layoutWeight(1)
+      .scrollBar(BarState.Off)
+      .contentEndOffset(0)
+      .padding({ left: 16, right: 16 })
+      .nestedScroll({
+        scrollForward: NestedScrollMode.SELF_FIRST,
+        scrollBackward: NestedScrollMode.SELF_FIRST
+      })
+    }
+    .width(StyleConstants.FULL_WIDTH)
+    .height('100%')
+    .onAreaChange((_oldArea: Area, area: Area): void => {
+      console.info('[RzdQueueLocate] viewport height=' + area.height + ' outerBottomPadding=0');
+    })
+  }
+
+  /** Sheet header: label with the queue count spaced on its right in a lighter tone. */
+  @Builder
+  SheetTitle() {
+    Row({ space: 12 }) {
+      Text('播放列表')
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('app.color.font_primary'))
+      Text(`${this.appState.getQueueLength()}`)
+        .fontSize(15)
+        .fontColor($r('app.color.font_tertiary'))
+        .opacity(0.7)
+      Blank()
+      Button({ type: ButtonType.Normal }) {
+        Image($r('app.media.ic_queue_locate'))
+          .width(22)
+          .height(22)
+          .fillColor(this.themeState.color)
+      }
+        .backgroundColor(Color.Transparent)
+        .width(40)
+        .height(40)
+        .borderRadius(20)
+        .enabled(this.appState.selectIndex >= 0 && this.appState.selectIndex < this.appState.getQueueLength())
+        .accessibilityText('定位到当前播放歌曲')
+        .onClick((): void => { this.locateCurrentSong(); })
+    }
+    .width('100%')
+    .padding({ right: 40 })
+  }
+
+  build() {
+    Column()
+      .width(1)
+      .height(1)
+      .hitTestBehavior(HitTestMode.None)
+      .bindSheet(this.isShow, this.SheetContent(), {
+        detents: [480, SheetSize.LARGE],
+        preferType: SheetType.BOTTOM,
+        dragBar: true,
+        showClose: true,
+        scrollSizeMode: ScrollSizeMode.FOLLOW_DETENT,
+        title: this.SheetTitle(),
+        backgroundColor: $r('app.color.panel_surface'),
+        onDisappear: (): void => {
+          this.onDismiss();
+        }
+      })
+  }
+}

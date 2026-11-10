@@ -1,0 +1,724 @@
+import { common } from '@kit.AbilityKit';
+import { AppStorageV2 } from '@kit.ArkUI';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+import { HdsNavDestination, HdsNavDestinationTitleMode, TitleSize } from '@kit.UIDesignKit';
+import { AppStorageKeys, FavoriteEntry, MusicAppState, MusicStoreService, SongTitleMarquee, ThemeState } from 'musicbasic';
+import { LXSearchSong, OnlinePlayUtil } from 'player';
+import { AccountService } from 'player';
+import { PlatformAccount, PlaylistInfo, PlaylistTrackInfo, PlatformTrackInfo, PlaylistMutationTrack, sourceName } from 'player';
+
+const DANGER_COLOR: string = '#E64545';
+/** 日志标签：grep `RzdPlatformCollect` 看收藏/取消收藏在线歌单的链路。 */
+const COLLECT_TAG: string = 'RzdPlatformCollect';
+
+const songCache: Map<string, PlatformTrackInfo[]> = new Map();
+
+class AccountGroup {
+  account: PlatformAccount = new PlatformAccount();
+  playlists: PlaylistInfo[] = [];
+  error: string = '';
+}
+
+class PlaylistDestination {
+  accountId: string = '';
+  playlistId: string = '';
+  dirId: string = '';
+  isEditable: boolean = false;
+}
+
+@ComponentV2
+export struct PlatformMusicPage {
+  @Param contentTopOffset: number = 0;
+  @Param pageScroller: Scroller = new Scroller();
+  @Local groups: AccountGroup[] = [];
+  @Local currentAccountId: string = '';
+  @Local currentPlaylists: PlaylistInfo[] = [];
+  @Local selectedKey: string = '';
+  @Local selectedTitle: string = '';
+  @Local selectedSource: string = '';
+  @Local selectedDestination: PlaylistDestination | null = null;
+  /** 当前选中的在线歌单是否已收藏（「我的」页歌单卡第二段的数据就是它写进去的）。 */
+  @Local selectedFavorited: boolean = false;
+  @Local songs: PlatformTrackInfo[] = [];
+  @Local isLoading: boolean = false;
+  @Local error: string = '';
+  @Local loadingPlaylists: boolean = false;
+  @Local avatarFailed: Set<string> = new Set();
+  @Local themeState: ThemeState =
+    AppStorageV2.connect(ThemeState, AppStorageKeys.THEME_STATE, () => new ThemeState())!;
+  @Local coverFailed: Set<string> = new Set();
+  /** 关闭回调（父组件控制返回）。 */
+  @Param onClose: () => void = () => {};
+  /** 刷新信号：父组件（标题栏刷新按钮）递增触发重新加载。 */
+  @Param refreshSignal: number = 0;
+
+  aboutToAppear(): void {
+    const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (context !== undefined) {
+      AccountService.init(context);
+    }
+    this.loadAll(false);
+  }
+
+  @Monitor('refreshSignal')
+  onRefreshSignalChanged(): void {
+    this.loadAll(true);
+  }
+
+  private async loadAll(forceRefresh: boolean): Promise<void> {
+    if (forceRefresh) songCache.clear();
+    this.loadingPlaylists = true;
+    try {
+      await AccountService.loadAccounts();
+      await AccountService.refreshKgAvatars();
+    } catch (err) {
+      // 忽略
+    }
+    const accounts: PlatformAccount[] = AccountService.listAccounts();
+    const groups: AccountGroup[] = [];
+    for (const account of accounts) {
+      const group: AccountGroup = new AccountGroup();
+      group.account = account;
+      try {
+        group.playlists = await AccountService.getUserPlaylists(account.id);
+      } catch (err) {
+        const error: Error = err as Error;
+        group.error = error.message ?? '获取歌单失败';
+      }
+      groups.push(group);
+    }
+    this.groups = groups;
+    this.loadingPlaylists = false;
+    if (groups.length === 0) {
+      this.clearSelected();
+      return;
+    }
+    if (this.findGroup(this.selectedKey) === undefined) {
+      await this.selectDefault(groups[0]);
+    } else {
+      await this.reloadSelected();
+    }
+  }
+
+  private async selectDefault(group: AccountGroup): Promise<void> {
+    if (group.playlists.length === 0 && group.error.length > 0) {
+      try {
+        group.playlists = await AccountService.getUserPlaylists(group.account.id);
+        group.error = '';
+      } catch (err) {
+        const error: Error = err as Error;
+        group.error = error.message ?? '获取歌单失败';
+      }
+      this.groups = this.groups.slice();
+    }
+    if (group.account.source.length > 0) {
+      await this.selectDaily(group.account);
+    } else if (group.playlists.length > 0) {
+      await this.selectPlaylist(group.account, group.playlists[0]);
+    } else {
+      this.clearSelected();
+    }
+  }
+
+  private findGroup(key: string): AccountGroup | undefined {
+    for (const group of this.groups) {
+      if (key.startsWith(`${group.account.id}:`)) return group;
+    }
+    return undefined;
+  }
+
+  private currentGroupError(): string {
+    const group: AccountGroup | undefined = this.findGroup(this.selectedKey);
+    if (group === undefined) return '';
+    return group.error;
+  }
+
+  private dailyTitle(source: string): string {
+    if (source === 'tx') return '每日30首';
+    return '每日推荐';
+  }
+
+  private clearSelected(): void {
+    this.selectedKey = '';
+    this.currentAccountId = '';
+    this.currentPlaylists = [];
+    this.selectedTitle = '';
+    this.selectedSource = '';
+    this.selectedDestination = null;
+    this.songs = [];
+    this.error = '';
+    this.isLoading = false;
+  }
+
+  private applyCurrentGroup(key: string): void {
+    const group: AccountGroup | undefined = this.findGroup(key);
+    this.currentAccountId = group === undefined ? '' : group.account.id;
+    this.currentPlaylists = group === undefined ? [] : group.playlists;
+  }
+
+  /**
+   * 同步「当前选中的在线歌单是否已收藏」。
+   *
+   * 每次切换选中项（歌单 / 每日推荐 / 账号默认）都要跑一次：每日推荐与账号默认不是
+   * 歌单（`selectedDestination === null`），那颗星要消失，不能残留上一张歌单的状态。
+   */
+  private syncSelectedFavorited(): void {
+    const dest: PlaylistDestination | null = this.selectedDestination;
+    this.selectedFavorited = dest !== null && dest.playlistId.length > 0 &&
+      MusicStoreService.getInstance().isFavoritePlaylist(this.selectedSource, dest.playlistId);
+  }
+
+  /** 当前选中歌单在 `currentPlaylists` 里的原始条目（拿 total / dirId 用）。 */
+  private selectedPlaylistInfo(): PlaylistInfo | undefined {
+    const dest: PlaylistDestination | null = this.selectedDestination;
+    if (dest === null || dest.playlistId.length === 0) {
+      return undefined;
+    }
+    for (let i: number = 0; i < this.currentPlaylists.length; i++) {
+      if (this.currentPlaylists[i].id === dest.playlistId) {
+        return this.currentPlaylists[i];
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * 收藏 / 取消收藏当前这张**在线歌单**。
+   *
+   * 写入 `MusicStoreService` 的 `favorite_playlists`（`FavoriteEntry`）：
+   *   · `id` / `source` = 平台歌单 id / 平台标识；`name` = 歌单名；
+   *   · `sub` = 平台名（`sourceName`）；`count` = 曲目数（优先用已拉到的 `songs`，
+   *     没拉到就用歌单自带的 `total` 文本，**都不编**）；
+   *   · `img` = 第一首曲目的封面（`songs[0].picUrl`，拿不到就留空 ⇒ 界面用占位图）。
+   * 「我的」页歌单卡的「收藏歌单」那一段就是读它（`@Monitor favoritePlaylistVersion`）。
+   */
+  private toggleCollectSelected(): void {
+    const dest: PlaylistDestination | null = this.selectedDestination;
+    if (dest === null || dest.playlistId.length === 0) {
+      return;
+    }
+    const store: MusicStoreService = MusicStoreService.getInstance();
+    if (store.isFavoritePlaylist(this.selectedSource, dest.playlistId)) {
+      store.removeFavoritePlaylist(this.selectedSource, dest.playlistId);
+      this.selectedFavorited = false;
+      hilog.info(0x0000, COLLECT_TAG, 'uncollect source=%{public}s id=%{public}s',
+        this.selectedSource, dest.playlistId);
+      return;
+    }
+    const entry: FavoriteEntry = new FavoriteEntry();
+    entry.id = dest.playlistId;
+    entry.source = this.selectedSource;
+    entry.name = this.selectedTitle;
+    entry.sub = sourceName(this.selectedSource);
+    const info: PlaylistInfo | undefined = this.selectedPlaylistInfo();
+    const totalText: string = info !== undefined ? info.total : '';
+    const parsed: number = totalText.length > 0 ? Number.parseInt(totalText, 10) : Number.NaN;
+    entry.count = this.songs.length > 0 ? this.songs.length : (Number.isNaN(parsed) ? 0 : parsed);
+    entry.img = this.songs.length > 0 ? this.songs[0].picUrl : '';
+    entry.time = Date.now();
+    store.addFavoritePlaylist(entry);
+    this.selectedFavorited = true;
+    hilog.info(0x0000, COLLECT_TAG,
+      'collect name=%{public}s source=%{public}s id=%{public}s count=%{public}d',
+      entry.name, entry.source, entry.id, entry.count);
+  }
+
+  private async selectDaily(account: PlatformAccount): Promise<void> {
+    const key: string = `${account.id}:daily`;
+    this.selectedKey = key;
+    this.applyCurrentGroup(key);
+    this.selectedTitle = this.dailyTitle(account.source);
+    this.selectedSource = account.source;
+    this.selectedDestination = null;
+    // 每日推荐不是「歌单」，收藏星要消失（否则会残留上一张歌单的收藏态）
+    this.syncSelectedFavorited();
+    this.error = '';
+    const cached: PlatformTrackInfo[] | undefined = songCache.get(key);
+    if (cached !== undefined) {
+      this.songs = cached;
+      this.isLoading = false;
+      return;
+    }
+    this.songs = [];
+    this.isLoading = true;
+    try {
+      const ids: string[] = await AccountService.getDailyTrackIds(account.id);
+      if (this.selectedKey !== key) return;
+      let infos: PlatformTrackInfo[] = [];
+      if (ids.length > 0) infos = await AccountService.getTrackDetails(account.id, ids);
+      if (this.selectedKey !== key) return;
+      this.songs = infos;
+      songCache.set(key, infos);
+    } catch (err) {
+      const error: Error = err as Error;
+      if (this.selectedKey !== key) return;
+      this.error = error.message ?? '加载失败';
+    } finally {
+      if (this.selectedKey === key) this.isLoading = false;
+    }
+  }
+
+  private async selectPlaylist(account: PlatformAccount, playlist: PlaylistInfo): Promise<void> {
+    const key: string = `${account.id}:${playlist.id}`;
+    this.selectedKey = key;
+    this.applyCurrentGroup(key);
+    this.selectedTitle = playlist.name;
+    this.selectedSource = account.source;
+    const destination: PlaylistDestination = new PlaylistDestination();
+    destination.accountId = account.id;
+    destination.playlistId = playlist.id;
+    destination.dirId = playlist.dirId;
+    destination.isEditable = playlist.isEditable;
+    this.selectedDestination = destination;
+    this.syncSelectedFavorited();
+    this.error = '';
+    const cached: PlatformTrackInfo[] | undefined = songCache.get(key);
+    if (cached !== undefined) {
+      this.songs = cached;
+      this.isLoading = false;
+      return;
+    }
+    this.songs = [];
+    this.isLoading = true;
+    try {
+      const tracks: PlaylistTrackInfo[] = await AccountService.getPlaylistTrackIds(account.id, playlist.id, playlist.dirId);
+      if (this.selectedKey !== key) return;
+      const removeMap: Map<string, string> = new Map();
+      for (const track of tracks) removeMap.set(track.id, track.removeId);
+      const ids: string[] = tracks.map((track: PlaylistTrackInfo) => track.id);
+      let infos: PlatformTrackInfo[] = [];
+      if (ids.length > 0) {
+        infos = await AccountService.getTrackDetails(account.id, ids);
+        for (const info of infos) info.removeId = removeMap.get(info.id) ?? '';
+      }
+      if (this.selectedKey !== key) return;
+      this.songs = infos;
+      songCache.set(key, infos);
+    } catch (err) {
+      const error: Error = err as Error;
+      if (this.selectedKey !== key) return;
+      this.error = error.message ?? '加载失败';
+    } finally {
+      if (this.selectedKey === key) this.isLoading = false;
+    }
+  }
+
+  private async reloadSelected(): Promise<void> {
+    const key: string = this.selectedKey;
+    if (key.length === 0) return;
+    const group: AccountGroup | undefined = this.findGroup(key);
+    if (group === undefined) return;
+    if (key.endsWith(':daily')) {
+      await this.selectDaily(group.account);
+      return;
+    }
+    const playlistId: string = key.substring(key.indexOf(':') + 1);
+    for (const playlist of group.playlists) {
+      if (playlist.id === playlistId) {
+        await this.selectPlaylist(group.account, playlist);
+        return;
+      }
+    }
+  }
+
+  private handleRemoveTrack(song: PlatformTrackInfo): void {
+    const destination: PlaylistDestination | null = this.selectedDestination;
+    if (destination === null || !destination.isEditable) return;
+    this.getUIContext().showAlertDialog({
+      title: '移除歌曲',
+      message: `确定将「${song.name}」从歌单移除吗？`,
+      autoCancel: true,
+      alignment: DialogAlignment.Center,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        },
+      },
+      secondaryButton: {
+        value: '移除',
+        fontColor: DANGER_COLOR,
+        action: () => {
+          this.doRemoveTrack(destination, song);
+        },
+      },
+    });
+  }
+
+  private async doRemoveTrack(destination: PlaylistDestination, song: PlatformTrackInfo): Promise<void> {
+    const mutation: PlaylistMutationTrack = new PlaylistMutationTrack();
+    mutation.songId = song.id;
+    mutation.platformId = song.removeId;
+    mutation.name = song.name;
+    mutation.source = song.source;
+    this.isLoading = true;
+    try {
+      await AccountService.removePlaylistTracks(destination.accountId, destination.playlistId, destination.dirId, [mutation]);
+      songCache.delete(`${destination.accountId}:${destination.playlistId}`);
+      await this.reloadSelected();
+    } catch (err) {
+      const error: Error = err as Error;
+      this.error = error.message ?? '移除失败';
+      this.isLoading = false;
+    }
+  }
+
+  private statusText(): string {
+    if (this.isLoading) return '加载中...';
+    if (this.error.length > 0) return this.error;
+    if (this.songs.length > 0) return '';
+    if (this.selectedKey.endsWith(':daily')) return '暂无每日推荐';
+    if (this.selectedKey.length > 0) return '暂无歌曲';
+    return '请先在平台账号管理中登录平台账号';
+  }
+
+  private markAvatarFailed(id: string): void {
+    const failed: Set<string> = new Set(this.avatarFailed);
+    failed.add(id);
+    this.avatarFailed = failed;
+  }
+
+  private markCoverFailed(id: string): void {
+    const failed: Set<string> = new Set(this.coverFailed);
+    failed.add(id);
+    this.coverFailed = failed;
+  }
+
+  @Builder
+  songRow(song: PlatformTrackInfo) {
+    Row() {
+      if (song.picUrl.length > 0 && !this.coverFailed.has(song.id)) {
+        Image(song.picUrl)
+          .width(42)
+          .height(42)
+          .borderRadius(8)
+          .objectFit(ImageFit.Cover)
+          .backgroundColor($r('sys.color.background_tertiary'))
+          .onError(() => {
+            this.markCoverFailed(song.id);
+          })
+      } else {
+        Text('♪')
+          .width(42)
+          .height(42)
+          .borderRadius(8)
+          .textAlign(TextAlign.Center)
+          .fontSize(18)
+          .fontColor(this.themeState.color)
+          .backgroundColor($r('sys.color.background_tertiary'))
+      }
+      Column() {
+        // ★ 2026-10-15：歌名过长改跑马灯（用户要求「各个页面歌曲名过长时改为用跑马灯显示」）。
+        //   字号/字重/字色逐字保留；父容器是 `Column` ⇒ 用组件默认的 `fillByWidth`（`width('100%')`）。
+        SongTitleMarquee({
+          text: song.name,
+          titleFontSize: 13,
+          titleFontColor: $r('sys.color.font_primary'),
+          titleFontWeight: FontWeight.Medium
+        })
+        Text(song.singer.length > 0 ? `${song.singer}${song.album.length > 0 ? ` · ${song.album}` : ''}` : song.album)
+          .fontSize(11)
+          .fontColor($r('sys.color.font_tertiary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ top: 3 })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .margin({ left: 10 })
+
+      if (song.interval.length > 0) {
+        Text(song.interval)
+          .fontSize(11)
+          .fontColor($r('sys.color.font_tertiary'))
+          .margin({ left: 6 })
+      }
+
+      if (this.selectedDestination !== null && this.selectedDestination.isEditable) {
+        Button('移除')
+          .type(ButtonType.Normal)
+          .fontSize(11)
+          .fontColor(DANGER_COLOR)
+          .backgroundColor($r('sys.color.background_tertiary'))
+          .height(26)
+          .margin({ left: 8 })
+          .onClick(() => {
+            this.handleRemoveTrack(song);
+          })
+      }
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+    .onClick(() => {
+      this.playPlatformSong(song);
+    })
+  }
+
+  /** 用 LX 引擎播放平台账号歌曲：整张歌单入列并从点击的歌曲开始。 */
+  private playPlatformSong(song: PlatformTrackInfo): void {
+    const songs: LXSearchSong[] = [];
+    let startIndex: number = 0;
+    for (let i: number = 0; i < this.songs.length; i++) {
+      const track: PlatformTrackInfo = this.songs[i];
+      songs.push({
+        songId: track.id,
+        name: track.name,
+        singer: track.singer,
+        albumName: track.album,
+        albumId: '',
+        source: track.source,
+        interval: track.interval,
+        img: track.picUrl,
+        types: []
+      });
+      if (track.id === song.id && track.source === song.source) {
+        startIndex = i;
+      }
+    }
+    if (songs.length === 0) {
+      return;
+    }
+    const appState: MusicAppState =
+      AppStorageV2.connect(MusicAppState, AppStorageKeys.MUSIC_APP_STATE, () => new MusicAppState())!;
+    void OnlinePlayUtil.playList(appState, songs, startIndex, this.getUIContext());
+  }
+
+  /**
+   * 华为账号卡片在本页面**不渲染**：它属于「登录平台音乐」那个面板
+   * （`AccountManageSheet`，见 `HuaweiAccountCard`）。本页面是「用平台账号听歌」的
+   * 歌单浏览页，混进来会让两件事看起来是一回事。
+   */
+
+  build() {
+    Column() {
+      if (this.groups.length === 0) {
+        Column() {
+          Text(this.loadingPlaylists ? '加载中...' : '请先在平台账号管理中登录平台账号')
+            .fontSize(13)
+            .fontColor($r('sys.color.font_tertiary'))
+            .textAlign(TextAlign.Center)
+            .padding({ left: 32, right: 32 })
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+      } else {
+        Scroll(this.pageScroller) {
+          Column() {
+            Scroll() {
+              Row({ space: 8 }) {
+                ForEach(this.groups, (group: AccountGroup) => {
+                  Row() {
+                    if (group.account.avatar.length > 0 && !this.avatarFailed.has(group.account.id)) {
+                      Image(group.account.avatar)
+                        .width(26)
+                        .height(26)
+                        .borderRadius(13)
+                        .objectFit(ImageFit.Cover)
+                        .backgroundColor(Color.White)
+                        .onError(() => {
+                          this.markAvatarFailed(group.account.id);
+                        })
+                    } else {
+                      Text(group.account.nickname.length > 0 ? group.account.nickname.substring(0, 1) : '?')
+                        .width(26)
+                        .height(26)
+                        .borderRadius(13)
+                        .textAlign(TextAlign.Center)
+                        .fontSize(12)
+                        .fontWeight(FontWeight.Bold)
+                        .fontColor(Color.White)
+                        .backgroundColor(Color.White)
+                    }
+                    Text(sourceName(group.account.source))
+                      .fontSize(12)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor(this.selectedKey.startsWith(`${group.account.id}:`) ? $r('sys.color.font_on_primary') : $r('sys.color.font_primary'))
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .margin({ left: 6 })
+                  }
+                  .height(38)
+                  .padding({ left: 8, right: 14 })
+                  .borderRadius(19)
+                  .backgroundColor(this.selectedKey.startsWith(`${group.account.id}:`) ? this.themeState.color : $r('sys.color.background_tertiary'))
+                  .onClick(() => {
+                    this.selectDefault(group);
+                  })
+                }, (group: AccountGroup) => group.account.id)
+              }
+              .padding({ left: 20, right: 20, top: 14, bottom: 8 })
+            }
+            .width('100%')
+            .height(62)
+            .scrollable(ScrollDirection.Horizontal)
+            .scrollBar(BarState.Off)
+            .edgeEffect(EdgeEffect.Spring)
+
+            Scroll() {
+              Row({ space: 8 }) {
+                if (this.currentAccountId.length > 0) {
+                  Row() {
+                    Text(this.dailyTitle(this.selectedSource))
+                      .fontSize(12)
+                      .fontWeight(this.selectedKey === `${this.currentAccountId}:daily` ? FontWeight.Medium : FontWeight.Normal)
+                      .fontColor(this.selectedKey === `${this.currentAccountId}:daily` ? this.themeState.color : $r('sys.color.font_tertiary'))
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .height(32)
+                  .padding({ left: 14, right: 14 })
+                  .borderRadius(16)
+                  .backgroundColor(this.selectedKey === `${this.currentAccountId}:daily` ? $r('sys.color.background_tertiary') : $r('sys.color.background_tertiary'))
+                  .onClick(() => {
+                    const group: AccountGroup | undefined = this.findGroup(`${this.currentAccountId}:daily`);
+                    if (group !== undefined) {
+                      this.selectDaily(group.account);
+                    }
+                  })
+                }
+                ForEach(this.currentPlaylists, (playlist: PlaylistInfo) => {
+                  Row() {
+                    Text(playlist.name)
+                      .fontSize(12)
+                      .fontWeight(this.selectedKey === `${this.currentAccountId}:${playlist.id}` ? FontWeight.Medium : FontWeight.Normal)
+                      .fontColor(this.selectedKey === `${this.currentAccountId}:${playlist.id}` ? this.themeState.color : $r('sys.color.font_tertiary'))
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    if (playlist.total.length > 0) {
+                      Text(playlist.total)
+                        .fontSize(10)
+                        .fontColor(this.selectedKey === `${this.currentAccountId}:${playlist.id}` ? this.themeState.color : $r('sys.color.font_tertiary'))
+                        .margin({ left: 5 })
+                    }
+                  }
+                  .height(32)
+                  .padding({ left: 14, right: 14 })
+                  .borderRadius(16)
+                  .backgroundColor(this.selectedKey === `${this.currentAccountId}:${playlist.id}` ? $r('sys.color.background_tertiary') : $r('sys.color.background_tertiary'))
+                  .onClick(() => {
+                    const group: AccountGroup | undefined = this.findGroup(`${this.currentAccountId}:daily`);
+                    if (group !== undefined) {
+                      this.selectPlaylist(group.account, playlist);
+                    }
+                  })
+                }, (playlist: PlaylistInfo) => `${this.currentAccountId}:${playlist.id}`)
+              }
+              .padding({ left: 20, right: 20, top: 6, bottom: 10 })
+            }
+            .width('100%')
+            .height(54)
+            .scrollable(ScrollDirection.Horizontal)
+            .scrollBar(BarState.Off)
+            .edgeEffect(EdgeEffect.Spring)
+
+            Row() {
+              Column() {
+                Text(this.selectedTitle.length > 0 ? this.selectedTitle : '平台音乐')
+                  .fontSize(15)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('sys.color.font_primary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                Text(this.selectedSource.length > 0 ? sourceName(this.selectedSource) : '')
+                  .fontSize(11)
+                  .fontColor($r('sys.color.font_tertiary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .margin({ top: 2 })
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              // ★ 收藏这张在线歌单（「我的」页歌单卡第二段「收藏歌单」的数据来源）。
+              //   只在选中的是**歌单**时出现；每日推荐 / 账号默认没有歌单身份，不给这颗星。
+              if (this.selectedDestination !== null && this.selectedDestination.playlistId.length > 0) {
+                Row() {
+                  SymbolGlyph(this.selectedFavorited ? $r('sys.symbol.star_fill') : $r('sys.symbol.star'))
+                    .fontSize(22)
+                    .fontColor([this.selectedFavorited ? this.themeState.color : $r('sys.color.icon_tertiary')])
+                }
+                .width(40)
+                .height(40)
+                .justifyContent(FlexAlign.Center)
+                .onClick(() => {
+                  this.toggleCollectSelected();
+                })
+                .accessibilityText(this.selectedFavorited ? '取消收藏歌单' : '收藏歌单')
+                .accessibilityLevel('yes')
+              }
+            }
+            .width('100%')
+            .padding({ left: 20, right: 20, top: 6, bottom: 8 })
+
+            if (this.currentGroupError().length > 0) {
+              Text(this.currentGroupError())
+                .width('100%')
+                .fontSize(11)
+                .fontColor(DANGER_COLOR)
+                .padding({ left: 20, right: 20, bottom: 8 })
+            }
+
+            if (this.isLoading) {
+              Column() {
+                Text('加载中...')
+                  .fontSize(12)
+                  .fontColor($r('sys.color.font_tertiary'))
+              }
+              .width('100%')
+              .padding({ top: 40, bottom: 40 })
+            } else if (this.songs.length > 0) {
+              ForEach(this.songs, (song: PlatformTrackInfo, index: number) => {
+                Column() {
+                  this.songRow(song)
+                  if (index < this.songs.length - 1) {
+                    Divider()
+                      .strokeWidth(0.5)
+                      .color($r('sys.color.comp_divider'))
+                      .margin({ left: 66, right: 14 })
+                  }
+                }
+                .width('100%')
+              }, (song: PlatformTrackInfo) => `${song.id}_${song.removeId}`)
+            } else {
+              Column() {
+                Text(this.statusText())
+                  .fontSize(12)
+                  .fontColor($r('sys.color.font_tertiary'))
+                  .textAlign(TextAlign.Center)
+                  .padding({ left: 16, right: 16 })
+              }
+              .width('100%')
+              .padding({ top: 40, bottom: 40 })
+            }
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .layoutWeight(1)
+        // ★ 用户 2026-10-11：「平台音乐页面上方有一块空白」——宿主面板已经让过一次顶（大设置页/二级页的首个 Blank），
+      //   这里再让一次就叠成一块死空白 ⇒ 内层不再加顶部 padding，让位只由宿主的滚动内容负责。
+      // ★ 用户 2026-10-12：「留白要写在**列表顶部**，不是屏幕顶部」⇒ 用官方 `contentStartOffset`
+      //   （滚动组件通用属性：内容起始到显示区边界的距离，**随内容滚走**），不再用外层 padding、也不用首个 Blank。
+      .contentStartOffset(this.contentTopOffset)
+        // ★★ 官方《开发应用沉浸式效果》→「滚动类场景」②：滚动容器要设
+        //   `clipContent(ContentClipMode.SAFE_AREA)` 才能"把内容层裁剪区域扩展至避让区"
+        //   —— 否则内容只会被按内容框裁掉，**永远画不进状态栏**（用户报「平台音乐页内容没延伸进状态栏」）。
+        //   ⚠️ 链上祖先不许有 `clip(true)`。
+        .clipContent(ContentClipMode.SAFE_AREA)
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+      }
+    }
+      .width('100%')
+      .height('100%')
+      // ★ 2026-10-12：页面级底色统一走 `app.color.page_background`
+      //   （base #F1F3F5 / dark #FF1C1C1E）—— 夜间模式的"各个页面背景"由这个 token 一处决定，
+      //   不再直接用 `sys.color.background_secondary`（系统色不在应用资源表里，改不动、也无法统一）。
+      .backgroundColor($r('app.color.page_background'))
+  }
+}
+
+@Builder
+export function PlatformMusicPageBuilder(name: string, param: Object) {
+  PlatformMusicPage({})
+}

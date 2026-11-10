@@ -1,0 +1,18 @@
+{
+  "name": "pc",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "musicbasic": "file:../../common/musicbasic",
+    "playlist": "file:../../features/playlist",
+    "player": "file:../../features/player",
+    "recommendation": "file:../../features/recommendation",
+    "setting": "file:../../features/setting",
+    "localmusic": "file:../../features/localmusic",
+    "sync": "file:../../features/sync",
+    "comment": "file:../../features/comment"
+  }
+}
