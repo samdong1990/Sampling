@@ -351,8 +351,6 @@ export struct PlaybackPage {
   @Local playbackSwiperIndex: number = 0;
   /** 濠殿喗绻傞張顒€煤閹间焦鍤曟繝濠傚暙缁€瀣煥濞戞澧﹂柛瀣噺缁嬪鍩€椤掆偓铻ｆい蹇撴祩閺€浠嬫煟閵娿儱顏ラ柍褜鍓欓張顒€煤閹稿骸绶炴慨妯稿劗閸嬫挸顓艰箛鏇狀槴闂佸搫瀚烽崹浼村箚娴ｈ桨娌柡鍥╁仧绾惧鏌ㄥ☉娆戭敚heet 闂?`ControlAreaComponent` 闂佹眹鍨洪惇褰掑焵?*/
   @Local playMenuOpen: boolean = false;
-  /** 标题/歌手点击后弹出的"平台 · 音质"提示是否展开。 */
-  @Local metaTipOpen: boolean = false;
   /**
    * 共享播放意图（`AppStorageV2`）：本页只负责 bump 评论入口的序号，
    * 真正挂评论面板的是 `ControlAreaComponent`（它 `@Monitor('intent.commentRequestSeq')`）。
@@ -1444,6 +1442,10 @@ export struct PlaybackPage {
    */
   private static readonly LYRIC_META_TITLE_FP: number = 15;
   private static readonly LYRIC_META_ARTIST_FP: number = 12;
+  /** 歌名上一行「平台 · 音质」常显文案字号（vp）。 */
+  private static readonly LYRIC_META_TAG_FP: number = 11;
+  /** 歌名上一行「平台 · 音质」常显文案颜色（金黄色）。 */
+  private static readonly LYRIC_META_TAG_COLOR: string = '#FFD700';
   /**
    * **闁诲繐绻嬬欢姘焽閻楀牄浜滈柣銏㈩焾娴滄繂鈽夐幘顖氫壕缂?*闂佹眹鍔岀€氼參鎮洪弴銏犺Е?濠殿喗绻傞張顒佹櫠濠婂應鍋撳☉娆樻當鐟滄澘娼￠弫宥夊锤閹额亪鏌ㄥ☉姗嗘Т闁逞屽墯閺岋繝鍩€?闁诲簼绲婚～澶愭偉閿濆绫嶉柣妯虹仛濞?`chrome().titleSize` / `chrome().artistSize`闂佹寧绋戝﹢妗縇L 濠碘剝顨愮紞鍥╂濮樿泛违?
    *
@@ -1465,6 +1467,8 @@ export struct PlaybackPage {
    */
   private static readonly META_TITLE_FP_COVER: number = 20;
   private static readonly META_ARTIST_FP_COVER: number = 14;
+  /** 歌名上一行「平台 · 音质」字号：封面页（随歌名 20fp 放大）。 */
+  private static readonly META_TAG_FP_COVER: number = 14;
 
   /**
    * 閻熸粎澧楅幐鍛婃櫠閻樿櫕浜ゆ繛鍡楁捣椤忛亶鎮介鍡楁噺閻?*濠殿喗绻傞懟顖炲箖閺囩姭鍋撳☉娆樻當鐟?*闂佹寧绋戝姝遍梺鎸庣☉椤︻偊鍩€椤掍焦鐓涢柍?婵炴垶鎸堕崐妤咁敂椤掍胶鈻曢悗锝庡枟閿涚喖鏌?*濠殿喗绻傞惌渚€鎯佸┑鍥ヤ簻濞达絽鍟扮粻濠氬箹?*闂佸湱绮敮鎺楀焵椤掑偆鍎犻柍?
@@ -1485,6 +1489,35 @@ export struct PlaybackPage {
   private metaArtistFp(): number {
     return PlaybackPage.lerpFp(PlaybackPage.META_ARTIST_FP_COVER,
       PlaybackPage.LYRIC_META_ARTIST_FP, this.lyricMorphT);
+  }
+
+  /**
+   * 歌名上一行常显的「平台 · 音质」文案。
+   *
+   * 2026-11-11：原先是点歌名/歌手弹 `bindPopup`（`MetaInfoTip()`），现改为常显在歌名上一行，
+   * 弹层与点击交互一并移除；缺平台或缺音质时自动降级，两者都没有返回空串
+   * （UI 侧用 `Visibility.None` 让该行不占位）。
+   */
+  private metaSourceQualityText(): string {
+    const song = this.state.getCurrentSongItem();
+    if (!song) {
+      return '';
+    }
+    const src: string = sourceDisplayName(song.source ?? '');
+    const quality: string = qualityDisplayName(song.quality ?? '');
+    if (src.length === 0) {
+      return quality;
+    }
+    if (quality.length === 0) {
+      return src;
+    }
+    return `${src} · ${quality}`;
+  }
+
+  /** 歌名上一行「平台 · 音质」字号：封面页 14fp → 歌词页 11fp，与歌名同比例缩放。 */
+  private metaTagFp(): number {
+    return PlaybackPage.lerpFp(PlaybackPage.META_TAG_FP_COVER,
+      PlaybackPage.LYRIC_META_TAG_FP, this.lyricMorphT);
   }
 
   /**
@@ -8247,26 +8280,6 @@ export struct PlaybackPage {
   }
 
   /** Root: 闂佽桨鐒﹂幐鎶藉Υ婢跺瞼纾介柍鍝勫€归弶?+ 缂備焦姊归悧婊兠虹捄銊﹀晳濞达絿顭堥ˉ鍛磼閹邦収娈旂憸鐗堢洴閺佸秹宕煎┑鍡氼唹闁荤喐鐟ュΛ娑㈡偂閳哄嫨浜归柕蹇嬪€曞▍鈩冩叏濠垫挾鍒伴柕鍫滅矙瀵即顢涘☉娆愵啋婵＄偑鍊楅。顔炬? 濠碘剝銇滈崕鑼暜鐎甸晲鐒婂〒姘ｅ亾婵為棿鍗虫俊?*/
-  /** 「平台 · 音质」提示：点播放页标题/歌手时弹出。 */
-  @Builder
-  private MetaInfoTip() {
-    Column({ space: 4 }) {
-      Text('平台：' + sourceDisplayName(this.state.getCurrentSongItem()?.source ?? ''))
-        .fontSize(13)
-        .fontColor($r('sys.color.font_primary'))
-      Text('音质：' + qualityDisplayName(this.state.getCurrentSongItem()?.quality ?? ''))
-        .fontSize(13)
-        .fontColor($r('sys.color.font_secondary'))
-      if ((this.state.getCurrentSongItem()?.playScript ?? '').length > 0) {
-        Text('音源：' + (this.state.getCurrentSongItem()?.playScript ?? ''))
-          .fontSize(12)
-          .fontColor($r('sys.color.font_tertiary'))
-          .maxLines(1)
-      }
-    }
-    .alignItems(HorizontalAlign.Start)
-    .padding(12)
-  }
   build() {
     // 闂?缂備焦顨忛崗娑氳姳閺屻儲鍋嬮柛顐墰缁?*闂佽桨鐒﹂幐鎶藉Υ婢跺瞼纾介柍鍝勫€归弶?+ 缂備焦姊归悧婊兠虹捄銊﹀晳濞达絿顭堥ˉ鍛磼閹邦収娈旂憸?*闂?
     //   闂佸憡鐟崹鐢革綖鐎ｎ喗鍎楅柍杞版祰閸╁苯霉?*闁哄鏅炲〒鍦礊濮椻偓瀵爼鏁撻悩韫凹闂佸搫顥￠妶鍛腐闂?*闂傚倵鍋撻柛顭戝枛閻撳倿鏌℃担瑙勭稇闁活偄妫濋弫?闂佽桨鑳剁换婵嬫煂濠婂牆绠绘い鎾跺枑閺夊綊鏌℃径鍡忓亾閾忣偒鍋ㄦ繛鏉戝悑閹倿骞楅棃娑卞殨闁?闂佹寧绋戦¨鈧紒?
@@ -9466,10 +9479,10 @@ export struct PlaybackPage {
    * 封面页的小歌词块（**只属于 Swiper 第 0 页**）。
    *
    * ## 一、位置：不写任何定位算式，交给主轴排布
-   * 它是 `metaRow` 里「歌名/歌手」那一列 `Column` 的**第 3 个子节点**，排在 `Text(歌名)`、`Text(歌手)`
+   * 从 `metaRow` 里歌名/歌手那列 `Column` 的**第 4 个子节点**起（`Text(平台)`、`Text(歌名)`、`Text(歌手)` 之后）
    * 之后，于是主轴上自然得到：
    * ```
-   *   小歌词顶边 ≡ 歌名行盒顶边 + title.h + 2 + singer.h = **歌手文字底边**
+   *   小歌词顶边 ≡ 歌名行盒顶边 + 平台行.h + title.h + 2 + singer.h = **歌手文字底边**
    *   x          ≡ 歌名/歌手文字左缘（同一个 Column；`metaRow` 的 `padding.left =
    *                lyricMetaLeftInset()` 已在这条链上，所以两边**同一个口径**，不需要再抄一遍 margin）
    * ```
@@ -9683,6 +9696,20 @@ export struct PlaybackPage {
           Column() {
             Row() {
           Column() {
+            // ★ 2026-11-11：平台 · 音质 常显在歌名上一行（金黄色），不再点歌名弹层。
+            //   本行是歌名列 Column 的第 1 个子节点：title/singer 与小歌词（流式兄弟）整体下移，
+            //   `LYRIC_META_ROW_H_VP = 34` 不变——metaRow 是 `VerticalAlign.Center` 定高行，
+            //   内容溢出由居中吸收，`metaOffsetY()` / `metaTopGeomY()` 的几何口径不受影响。
+            Text(this.metaSourceQualityText())
+              .fontSize(this.metaTagFp())
+              .fontWeight(FontWeight.Medium)
+              .fontColor(PlaybackPage.LYRIC_META_TAG_COLOR)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .textAlign(TextAlign.Start)
+              .width(StyleConstants.FULL_WIDTH)
+              .margin({ bottom: 1 })
+              .visibility(this.metaSourceQualityText().length > 0 ? Visibility.Visible : Visibility.None)
             Text(this.state.getCurrentSongItem()?.title ?? '', { controller: this.titleController })
               // 闂?缂備焦妫忛崹鎶藉磻閿濆棛鈻斿┑鐘插暙琚氶梺鎸庣☉閻楀棛鏁?`MusicPlayInfoBlock` 闂佹眹鍔岀€氼垱绂嶇€靛憡瀚婚柨婵嗙箳缁€鍡涙煃閵夛附鐓涢柍?闁?`publishMetaEndpoint`
               .id(PLAYER_META_TITLE_ID)
@@ -9697,12 +9724,6 @@ export struct PlaybackPage {
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .textAlign(TextAlign.Start)
               .width(StyleConstants.FULL_WIDTH)
-              // ★ 点标题/歌手 → 弹「平台 · 音质」提示。
-              //   ⚠️ bindPopup 只挂**一处**（歌名行外层 Column，见下面 9090 行的 .bindPopup）：
-              //      两个 Text 各挂一次会出现两个气泡（用户 2026-10-29 反馈）。
-              .onClick((): void => {
-                this.metaTipOpen = !this.metaTipOpen;
-              })
             Text(this.state.getCurrentSongItem()?.singer ?? '', { controller: this.singerController })
               .id(PLAYER_META_SINGER_ID)
               .onAreaChange((): void => {
@@ -9716,13 +9737,9 @@ export struct PlaybackPage {
               .textAlign(TextAlign.Start)
               .width(StyleConstants.FULL_WIDTH)
               .margin({ top: 2 })
-              // ★ 歌手行同样可点，提示当前平台与音质（弹层统一挂在下面的歌名行容器上）
-              .onClick((): void => {
-                this.metaTipOpen = !this.metaTipOpen;
-              })
             // ★★★ 2026-10-18（第五轮）：小歌词搬回"歌名行之下"，而且**只属于封面页**（见下）。
-            //   位置 = 本 Column 的**第 3 个子节点**（主轴自然排在歌手文字之后）⇒
-            //     小歌词顶边 ≡ 歌手文字底边 = 歌名行盒顶边 + title.h + 2 + singer.h
+            //   小歌词 = 歌名列 Column 的**第 4 个子节点**（平台行、歌名、歌手之后），位置纯流式：
+            //     小歌词顶边 ≡ 歌手文字底边 = 歌名行盒顶边 + 平台行.h + title.h + 2 + singer.h
             //     x          ≡ 歌名/歌手文字左缘（**同一个 Column**：`metaRow` 的 `padding.left`
             //                  = `lyricMetaLeftInset()` 已经在这条链上生效，不需要再抄一遍 margin）
             //   两个等式都不经过实测、不经过 `estBoxHVp()`/`metaOffsetY()` ⇒ 完整推导见
@@ -9738,18 +9755,6 @@ export struct PlaybackPage {
           .height(PlaybackPage.LYRIC_META_ROW_H_VP)
           .layoutWeight(1)
           .alignItems(HorizontalAlign.Start)
-          // ★ 唯一一处 bindPopup：气泡锚在"歌名+歌手"这一整行上，
-          //   点标题或点歌手都只弹这一个（两处各挂一次会出现两个气泡）。
-          .bindPopup($$this.metaTipOpen, {
-            builder: this.MetaInfoTip,
-            placement: Placement.Top,
-            enableArrow: true,
-            onStateChange: (event: PopupStateChangeParam): void => {
-              if (!event.isVisible) {
-                this.metaTipOpen = false;
-              }
-            }
-          })
 
           // 闂?闂佸搫鍟版慨鐑藉疾?`metaRow` 闂佸憡鐟ラ崢鏍疾閸洘鐒介柨婵嗗閳峰牆鈽夐幙鍐х盎婵炲瓨锕㈠浠嬪炊妞嬪海顦ーPlayerPage闁诲海鎳撻張顒勫汲椤ゆ杯闁诲氦顫夊銊┾€?md` 闁?.2闂佹寧绋戦¨鈧紒?
           //   `SymbolGlyph 闂佽　鍋撻柟顖滃椤ユ叢 + `SymbolGlyph 闂佸搫娲﹀娆撍囩缓娑㈡煏?
@@ -9931,7 +9936,7 @@ export struct PlaybackPage {
           //     位移壳顶边 = (estBoxHVp() − 34)/2 + metaOffsetY()
           //                = (estBoxHVp() − 34)/2 + [ metaTopGeomY(t, 34) − (estBoxHVp() − 34)/2 ]
           //                = metaTopGeomY(t, 34)                ← 歌名行顶边 = 与"加小歌词之前"逐值相同
-          //     小歌词顶边 = 位移壳顶边 + title.h + 2 + singer.h  ← 同一条主轴上的第 3 个子节点
+          //     小歌词顶边 = 位移壳顶边 + 平台行.h + title.h + 2 + singer.h  ← 同一条主轴上的第 4 个子节点
           //                = 歌手文字底边 = 歌名行盒顶边 + 歌名/歌手两行文字高
           //   ⇒ 等式里只剩"34"这一个常量，而它出现的两处（居中盒的子节点定高 / `metaOffsetY()` 的 rowH）
           //     就是同一个 `LYRIC_META_ROW_H_VP` ⇒ 换机型、换 `estBoxHVp()` 都不会再偏。
