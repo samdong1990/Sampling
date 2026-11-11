@@ -112,9 +112,63 @@ function pickScriptField(script: string, key: string): string {
   return m === null ? '' : m[1];
 }
 
+/** checkUpdate 接口返回体（洛雪音源通用约定）。 */
+interface UpdateCheckPayload {
+  code?: number;
+  currentkey?: string;
+  data?: UpdateCheckData | null;
+}
+
+/** checkUpdate 接口里的更新描述。 */
+interface UpdateCheckData {
+  updateUrl?: string;
+  updateMsg?: string;
+  version?: string;
+}
+
+/**
+ * 由脚本的 `API_URL` 派生候选的 checkUpdate 地址。
+ *
+ * 洛雪音源服务端**没有统一**的更新接口路径，各音源脚本自己拼：
+ *   - 聆澜音源等：`${API_URL}/script?checkUpdate=<md5>&key=<key>&type=lx`
+ *   - 部分旧音源：`${API_URL}/script/lx?checkUpdate=<md5>&key=<key>`
+ *   - 早期版本：`${API_URL}/script/lxmusic?checkUpdate=<md5>&key=<key>`
+ * 所以这里按「与脚本自身规则一致 → 旧式路径」的顺序给出候选，依次探测。
+ *
+ * @param apiUrl 脚本里的 `API_URL`
+ * @param query 已拼好的 `checkUpdate=...&key=...`
+ */
+function buildUpdateCheckUrls(apiUrl: string, query: string): string[] {
+  let base: string = apiUrl;
+  // API_URL 若已带 /script 段（少见），截断后统一补
+  const scriptIdx: number = base.indexOf('/script');
+  if (scriptIdx > 0) {
+    base = base.substring(0, scriptIdx);
+  }
+  // 与脚本自身一致：`API_URL.replace("/music", "")`
+  if (base.indexOf('/music') >= 0) {
+    base = base.replace('/music', '');
+  }
+  while (base.endsWith('/')) {
+    base = base.substring(0, base.length - 1);
+  }
+  return [
+    base + '/script?' + query + '&type=lx',
+    base + '/script/lx?' + query,
+    base + '/script/lxmusic?' + query
+  ];
+}
+
 /**
  * 主动检查某个音源是否有更新（读本地脚本文本 → 提取 API_URL/API_KEY/SCRIPT_MD5 →
  * 请求脚本的 checkUpdate 接口）。这是**最可靠**的一条路：不依赖脚本是否上报 alert。
+ *
+ * ★ 2026-11-11 修复（用户：点更新后跳浏览器，页面显示 `Plugin not found`）：
+ *   之前把更新接口**硬编码**成 `${API_URL}/script/lxmusic`。那是某个音源厂商的旧路径，
+ *   服务端已废弃：checkUpdate 还回 200，但下发的 `updateUrl` 指向一个 404 地址，
+ *   下载必然失败 → 调用方跳浏览器 → 用户看到空白的 `Plugin not found`。
+ *   现在改为多候选依次探测，首选与脚本自身 `checkUpdate()` 完全一致的规则；
+ *   服务端明确返回 `data: null` 时立刻判定「已是最新」，不再往后试。
  */
 export async function checkSourceUpdateRemote(apiId: string): Promise<SourceUpdateInfo> {
   const out: SourceUpdateInfo = new SourceUpdateInfo();
@@ -137,46 +191,61 @@ export async function checkSourceUpdateRemote(apiId: string): Promise<SourceUpda
     console.info('[RzdSourceUpdate] ' + apiId + ' no API_URL/SCRIPT_MD5');
     return out;
   }
-  const url: string = apiUrl + '/script/lxmusic?checkUpdate=' + md5 +
-    (apiKey.length > 0 ? ('&key=' + apiKey) : '');
-  const req: http.HttpRequest = http.createHttp();
-  try {
-    const resp: http.HttpResponse = await req.request(url, {
-      method: http.RequestMethod.GET,
-      connectTimeout: UPDATE_CHECK_TIMEOUT,
-      readTimeout: UPDATE_CHECK_TIMEOUT
-    });
-    const text: string = typeof resp.result === 'string' ? resp.result : JSON.stringify(resp.result);
-    let body: Record<string, Object>;
+
+  const keyPart: string = apiKey.length > 0 ? ('&key=' + encodeURIComponent(apiKey)) : '';
+  const query: string = 'checkUpdate=' + encodeURIComponent(md5) + keyPart;
+  const candidates: string[] = buildUpdateCheckUrls(apiUrl, query);
+
+  for (let i = 0; i < candidates.length; i++) {
+    const url: string = candidates[i];
+    const req: http.HttpRequest = http.createHttp();
+    let payload: UpdateCheckPayload | null = null;
     try {
-      body = JSON.parse(text) as Record<string, Object>;
-    } catch (_parseErr) {
-      out.error = '更新接口返回异常';
+      const resp: http.HttpResponse = await req.request(url, {
+        method: http.RequestMethod.GET,
+        connectTimeout: UPDATE_CHECK_TIMEOUT,
+        readTimeout: UPDATE_CHECK_TIMEOUT
+      });
+      const text: string = typeof resp.result === 'string' ? resp.result : JSON.stringify(resp.result);
+      if (resp.responseCode === 200) {
+        try {
+          payload = JSON.parse(text) as UpdateCheckPayload;
+        } catch (_parseErr) {
+          // 返回的不是 JSON（例如废弃路径的 "Plugin not found"）→ 换下一个候选
+          payload = null;
+        }
+      }
+    } catch (err) {
+      payload = null;
+    } finally {
+      req.destroy();
+    }
+
+    if (payload === null) {
+      console.info('[RzdSourceUpdate] ' + apiId + ' candidate ' + String(i) + ' unusable');
+      continue;
+    }
+    if (payload.code !== 200) {
+      out.error = '服务端返回 ' + String(payload.code);
+      console.info('[RzdSourceUpdate] ' + apiId + ' code=' + String(payload.code));
       return out;
     }
-    if (Number(body.code) !== 200) {
-      out.error = '服务端返回 ' + String(body.code);
-      console.info('[RzdSourceUpdate] ' + apiId + ' code=' + String(body.code));
-      return out;
-    }
-    const data: Record<string, Object> | undefined = body.data as Record<string, Object> | undefined;
-    if (data === undefined) {
+    // data 为 null / 缺省 表示「已是最新」，这是明确答复，不再尝试其他候选
+    if (payload.data === undefined || payload.data === null) {
       out.error = '已是最新版本';
       console.info('[RzdSourceUpdate] ' + apiId + ' up-to-date');
       return out;
     }
     out.hasUpdate = true;
-    out.updateUrl = String(data.updateUrl ?? '');
-    out.message = String(data.updateMsg ?? '');
+    out.updateUrl = payload.data.updateUrl ?? '';
+    out.message = payload.data.updateMsg ?? '';
     console.info('[RzdSourceUpdate] ' + apiId + ' update available url=' + out.updateUrl);
     return out;
-  } catch (err) {
-    out.error = '检查更新请求失败';
-    console.info('[RzdSourceUpdate] ' + apiId + ' request failed');
-    return out;
-  } finally {
-    req.destroy();
   }
+
+  out.error = '更新接口不可用（该音源可能未开启检查更新）';
+  console.info('[RzdSourceUpdate] ' + apiId + ' all candidates failed');
+  return out;
 }
 
 /**
@@ -232,17 +301,31 @@ export async function checkAndApplySourceUpdate(api: LXUserApiInfo): Promise<Sou
       readTimeout: UPDATE_CHECK_TIMEOUT,
       expectDataType: http.HttpDataType.STRING
     });
+    // ★ 2026-11-11：下载失败不再 openUrl。服务端下发的 updateUrl 可能本身就是 404
+    //   （例如废弃的 /script/lxmusic 路径），跳浏览器只会看到空白的 "Plugin not found"。
     if (resp.responseCode !== 200 || typeof resp.result !== 'string') {
       out.applied = false;
-      out.message = '新版本下载失败，请检查网络';
-      out.openUrl = updateUrl;
+      out.message = '新版本下载失败（HTTP ' + String(resp.responseCode) + '），请稍后重试';
       return out;
     }
     const script: string = resp.result as string;
     if (script.length > UPDATE_DOWNLOAD_MAX_BYTES) {
       out.applied = false;
       out.message = '新版本脚本过大（超过 9MB）';
-      out.openUrl = updateUrl;
+      return out;
+    }
+    // 内容不像洛雪脚本（没有 @name 头注释）时先分类，避免把错误页当更新页打开
+    if (script.indexOf('@name') < 0) {
+      const head: string = script.substring(0, 300).toLowerCase();
+      const looksLikePage: boolean = head.indexOf('<html') >= 0 || head.indexOf('<!doctype') >= 0;
+      out.applied = false;
+      if (looksLikePage) {
+        // 真的是网页更新页（kdocs 等）→ 交回调用方跳浏览器
+        out.message = '该音源需在网页中更新，已打开更新页';
+        out.openUrl = updateUrl;
+      } else {
+        out.message = '下载到的内容不是音源脚本，已取消更新';
+      }
       return out;
     }
     // importApi 同 @name 不同版本会原地替换（保留原 id 与选中状态）→ 自动覆盖更新
@@ -253,15 +336,12 @@ export async function checkAndApplySourceUpdate(api: LXUserApiInfo): Promise<Sou
       console.info('[RzdSourceUpdate] ' + api.name + ' applied ok=' + imported.message);
       return out;
     }
-    // ④ 内容不是脚本（网页/kdocs）：交回调用方跳浏览器
     out.applied = false;
-    out.message = imported.message + '，已打开更新页';
-    out.openUrl = updateUrl;
+    out.message = imported.message;
     return out;
   } catch (err) {
     out.applied = false;
     out.message = '下载失败，请检查网络';
-    out.openUrl = updateUrl;
     return out;
   } finally {
     req.destroy();
